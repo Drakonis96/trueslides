@@ -1,0 +1,13 @@
+services:
+  trueslides:
+    build: .
+    ports:
+      - "5959:3000"
+    environment:
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+    volumes:
+      - app-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  app-data:
