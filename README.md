@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  Build presentation decks grounded on real images (not AI generated), edit them manually, or generate speaker notes from an existing PowerPoint or document.
+  Automatically build presentation decks grounded on real images (not AI generated), edit them manually, or generate speaker notes from an existing PowerPoint or document.
 </p>
 
 ## Overview
