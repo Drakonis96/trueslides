@@ -23,6 +23,12 @@ jest.mock("@/lib/key-store", () => ({
   getApiKey: (...args: unknown[]) => mockGetApiKey(...args),
 }));
 
+jest.mock("@/lib/rate-limit", () => ({
+  rateLimiters: {
+    ai: { check: jest.fn().mockReturnValue({ allowed: true }) },
+  },
+}));
+
 import { POST } from "@/app/api/generate/route";
 import { NextRequest } from "next/server";
 

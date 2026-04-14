@@ -199,7 +199,7 @@ function AITab() {
                 : "text-[var(--muted)] hover:text-[var(--fg)]"
             }`}
           >
-            {p.id === "openrouter" ? <IconGlobe size={12} /> : p.id === "openai" ? <IconSparkles size={12} /> : p.id === "gemini" ? <IconZap size={12} /> : <IconFileText size={12} />}
+            {p.id === "openrouter" ? <img src="/svg/openrouter.svg" alt="" width={14} height={14} className="inline-block" /> : p.id === "openai" ? <img src="/svg/openai.svg" alt="" width={14} height={14} className="inline-block" /> : p.id === "gemini" ? <img src="/svg/google.svg" alt="" width={14} height={14} className="inline-block" /> : <img src="/svg/anthropic.svg" alt="" width={14} height={14} className="inline-block" />}
             {p.name}
             {p.hasKey && <span className="ml-1"><IconCheck size={12} className="inline" /></span>}
           </button>
@@ -508,6 +508,12 @@ function ImagesTab() {
                         if (canToggle) toggleImageSource(source.id);
                       }}
                       disabled={!canToggle}
+                      title={isEnabled
+                        ? (lang === "es" ? `Desactivar ${source.name}` : `Disable ${source.name}`)
+                        : canToggle
+                        ? (lang === "es" ? `Activar ${source.name}` : `Enable ${source.name}`)
+                        : (lang === "es" ? "Necesita clave API para activar" : "API key required to enable")
+                      }
                       className={`w-5 h-5 rounded-md border-2 flex items-center justify-center transition-colors shrink-0 ${
                         isEnabled
                           ? "bg-[var(--accent)] border-[var(--accent)]"
@@ -642,6 +648,8 @@ function ImagesTab() {
                   type="button"
                   role="switch"
                   aria-checked={opt.isActive}
+                  aria-label={opt.label}
+                  title={opt.desc}
                   onClick={() => opt.onToggle()}
                   className={`w-10 h-6 rounded-full relative transition-colors shrink-0 cursor-pointer ${
                     opt.isActive ? "bg-[var(--accent)]" : "bg-[var(--border)]"
@@ -687,6 +695,8 @@ function ImagesTab() {
                 type="button"
                 role="switch"
                 aria-checked={settings.imageVerification.enabled}
+                aria-label={lang === "es" ? "Verificación visual con IA" : "AI Visual Verification"}
+                title={lang === "es" ? "Usa un modelo de visión para describir cada imagen candidata y elegir la mejor" : "Uses a vision model to describe each candidate image and pick the best one"}
                 onClick={() => setImageVerification("enabled", !settings.imageVerification.enabled)}
                 className={`w-10 h-6 rounded-full relative transition-colors shrink-0 cursor-pointer ${
                   settings.imageVerification.enabled ? "bg-[var(--accent)]" : "bg-[var(--border)]"
@@ -1084,10 +1094,12 @@ function DangerTab() {
             <button
               onClick={() => setConfirmAction(action)}
               disabled={loading}
-              className="shrink-0 px-3 py-1.5 rounded-lg text-xs font-medium bg-[var(--danger)]/10 text-[var(--danger)] border border-[var(--danger)]/30 hover:bg-[var(--danger)]/20 transition-colors disabled:opacity-50"
+              aria-label={label}
+              title={label}
+              className="shrink-0 h-9 w-9 rounded-lg flex items-center justify-center bg-[var(--danger)]/10 text-[var(--danger)] border border-[var(--danger)]/30 hover:bg-[var(--danger)]/20 transition-colors disabled:opacity-50"
             >
-              <IconTrash size={13} className="inline mr-1 -mt-0.5" />
-              {label}
+              <IconTrash size={14} />
+              <span className="sr-only">{label}</span>
             </button>
           </div>
         ))}

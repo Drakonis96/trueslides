@@ -1,11 +1,11 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Flashlight, Pencil, Circle, Trash2 } from "lucide-react";
+import { Flashlight, Pencil, Circle, Trash2, Search } from "lucide-react";
 
 /* ── Types ── */
 
-export type ToolMode = "none" | "flashlight" | "draw" | "pointer";
+export type ToolMode = "none" | "flashlight" | "draw" | "pointer" | "magnifier";
 export type FlashlightShape = "circle" | "rect-h" | "rect-v";
 
 export interface OverlayState {
@@ -20,6 +20,8 @@ export interface OverlayState {
   pointerSize: number; // fraction of slide width
   drawSize: number;    // fraction of slide width mapped to px later
   drawStrokes: { x: number; y: number }[][];
+  magnifierSize: number; // fraction of slide width for lens radius
+  magnifierZoom: number; // zoom factor (e.g. 2 = 2x)
 }
 
 export const DEFAULT_OVERLAY: OverlayState = {
@@ -32,7 +34,32 @@ export const DEFAULT_OVERLAY: OverlayState = {
   pointerSize: 0.015,
   drawSize: 0.004,
   drawStrokes: [],
+  magnifierSize: 0.15,
+  magnifierZoom: 2,
 };
+
+/** Max total draw points across all strokes before auto-simplifying. */
+const MAX_DRAW_POINTS = 3000;
+
+/**
+ * Downsample strokes when they exceed MAX_DRAW_POINTS to cap memory.
+ * Keeps every Nth point (Ramer-Douglas-Peucker is overkill for a live tool).
+ */
+function simplifyStrokes(strokes: { x: number; y: number }[][]): { x: number; y: number }[][] {
+  let total = 0;
+  for (const s of strokes) total += s.length;
+  if (total <= MAX_DRAW_POINTS) return strokes;
+  // Keep every 2nd point in each stroke (preserves first/last)
+  return strokes.map((stroke) => {
+    if (stroke.length <= 4) return stroke;
+    const simplified = [stroke[0]];
+    for (let i = 2; i < stroke.length - 1; i += 2) {
+      simplified.push(stroke[i]);
+    }
+    simplified.push(stroke[stroke.length - 1]);
+    return simplified;
+  });
+}
 
 export function clearOverlayDrawings(state: OverlayState): OverlayState {
   return {
@@ -124,6 +151,23 @@ export function OverlayRenderer({
       ctx.stroke();
       ctx.restore();
     }
+
+    // Magnifier lens ring (the actual zoom is rendered as a DOM element)
+    if (state.tool === "magnifier") {
+      const r = state.magnifierSize * width;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.8)";
+      ctx.lineWidth = Math.max(2, r * 0.04);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cx, cy, r + Math.max(2, r * 0.04) / 2, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.4)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.restore();
+    }
   }, [state, width, height]);
 
   return (
@@ -181,7 +225,7 @@ export function InteractiveOverlay({
         const strokes = [...next.drawStrokes];
         const last = [...strokes[strokes.length - 1], { x, y }];
         strokes[strokes.length - 1] = last;
-        next.drawStrokes = strokes;
+        next.drawStrokes = simplifyStrokes(strokes);
       }
 
       onOverlayChange(next);
@@ -294,6 +338,23 @@ export function InteractiveOverlay({
       ctx.stroke();
       ctx.restore();
     }
+
+    // Magnifier lens ring
+    if (overlayState.tool === "magnifier") {
+      const r = overlayState.magnifierSize * width;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.8)";
+      ctx.lineWidth = Math.max(2, r * 0.04);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cx, cy, r + Math.max(2, r * 0.04) / 2, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.4)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.restore();
+    }
   }, [overlayState, width, height]);
 
   const cursorStyle =
@@ -318,6 +379,9 @@ export function InteractiveOverlay({
       } else if (overlayState.tool === "pointer") {
         let sz = Math.max(0.005, Math.min(0.04, overlayState.pointerSize + delta * 0.002));
         next.pointerSize = sz;
+      } else if (overlayState.tool === "magnifier") {
+        let sz = Math.max(0.05, Math.min(0.3, overlayState.magnifierSize + delta * 0.02));
+        next.magnifierSize = sz;
       }
       onOverlayChange(next);
       e.preventDefault();
@@ -348,6 +412,61 @@ export function InteractiveOverlay({
   );
 }
 
+/* ── Magnifier lens: renders a zoomed circular clip of the slide ── */
+
+export function MagnifierRenderer({
+  state,
+  width,
+  height,
+  children,
+}: {
+  state: OverlayState;
+  width: number;
+  height: number;
+  /** The slide content to magnify (e.g. <SlideRenderer />) */
+  children: React.ReactNode;
+}) {
+  if (state.tool !== "magnifier" || !state.cursorActive) return null;
+
+  const zoom = state.magnifierZoom;
+  const r = state.magnifierSize * width;
+  const diameter = r * 2;
+  const cx = state.cursorX * width;
+  const cy = state.cursorY * height;
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        left: cx - r,
+        top: cy - r,
+        width: diameter,
+        height: diameter,
+        borderRadius: "50%",
+        overflow: "hidden",
+        border: "2px solid rgba(255,255,255,0.7)",
+        boxShadow: "0 0 12px rgba(0,0,0,0.5)",
+        pointerEvents: "none",
+        zIndex: 15,
+      }}
+    >
+      <div
+        style={{
+          width: width,
+          height: height,
+          transform: `scale(${zoom})`,
+          transformOrigin: `${state.cursorX * 100}% ${state.cursorY * 100}%`,
+          position: "absolute",
+          left: -(cx - r),
+          top: -(cy - r),
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
 /* ── Toolbar for selecting tool & adjusting sizes ── */
 
 export function PresenterToolbar({
@@ -372,7 +491,7 @@ export function PresenterToolbar({
     onOverlayChange({ ...overlayState, drawStrokes: [] });
   };
 
-  // Keyboard shortcuts: Cmd/Ctrl + Alt + S/D/P
+  // Keyboard shortcuts: Cmd/Ctrl + Alt + S/D/P/M
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!e.altKey || !(e.metaKey || e.ctrlKey)) return;
@@ -380,6 +499,7 @@ export function PresenterToolbar({
       if (k === "s") { e.preventDefault(); setTool("flashlight"); }
       else if (k === "d") { e.preventDefault(); setTool("draw"); }
       else if (k === "p") { e.preventDefault(); setTool("pointer"); }
+      else if (k === "m") { e.preventDefault(); setTool("magnifier"); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -480,6 +600,36 @@ export function PresenterToolbar({
             onChange={(e) => onOverlayChange({ ...overlayState, pointerSize: Number(e.target.value) / 1000 })}
             className="w-16 h-1 accent-[var(--accent)]"
           />
+        </div>
+      )}
+
+      {/* Magnifier */}
+      <button onClick={() => setTool("magnifier")} className={btnClass(tool === "magnifier")} title={`${es ? "Lupa" : "Magnifier"} (${modKey}+Alt+M)`}>
+        <Search size={14} className="inline -mt-0.5" /> {es ? "Lupa" : "Magnifier"}
+        <kbd className="ml-1 text-[9px] opacity-50">{modKey.charAt(0)}⌥M</kbd>
+      </button>
+
+      {tool === "magnifier" && (
+        <div className="flex items-center gap-1.5 pl-1 border-l border-[var(--border)]">
+          <span className="text-[10px] text-[var(--muted)]">{es ? "Tamaño" : "Size"}</span>
+          <input
+            type="range"
+            min={5}
+            max={30}
+            value={Math.round(overlayState.magnifierSize * 100)}
+            onChange={(e) => onOverlayChange({ ...overlayState, magnifierSize: Number(e.target.value) / 100 })}
+            className="w-16 h-1 accent-[var(--accent)]"
+          />
+          <span className="text-[10px] text-[var(--muted)] ml-1">{es ? "Zoom" : "Zoom"}</span>
+          <input
+            type="range"
+            min={15}
+            max={50}
+            value={Math.round(overlayState.magnifierZoom * 10)}
+            onChange={(e) => onOverlayChange({ ...overlayState, magnifierZoom: Number(e.target.value) / 10 })}
+            className="w-16 h-1 accent-[var(--accent)]"
+          />
+          <span className="text-[10px] font-mono text-[var(--muted)]">{overlayState.magnifierZoom.toFixed(1)}x</span>
         </div>
       )}
     </div>

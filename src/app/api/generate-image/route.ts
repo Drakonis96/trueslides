@@ -3,6 +3,7 @@ import { AIProvider } from "@/lib/types";
 import { getApiKey } from "@/lib/key-store";
 import { getSessionId } from "@/lib/session";
 import { callAI, sanitizeErrorMessage } from "@/lib/ai-client";
+import { rateLimiters } from "@/lib/rate-limit";
 
 export const maxDuration = 120;
 
@@ -162,9 +163,17 @@ export async function POST(req: NextRequest) {
 
     const sessionId = await getSessionId();
 
+    const rl = rateLimiters.ai.check(sessionId);
+    if (!rl.allowed) {
+      return NextResponse.json(
+        { error: "Too many requests. Please wait before trying again." },
+        { status: 429, headers: { "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)) } }
+      );
+    }
+
     // Map image gen provider to key-store provider
     const keyProvider: AIProvider = provider === "openai" ? "openai" : "gemini";
-    const apiKey = getApiKey(sessionId, keyProvider);
+    const apiKey = getApiKey(keyProvider);
     if (!apiKey) {
       return NextResponse.json(
         { error: `No API key found for ${provider}. Please set it in Settings.` },
@@ -174,7 +183,7 @@ export async function POST(req: NextRequest) {
 
     // Auto-generate prompt if requested
     if (autoPrompt && slideContext && textAiConfig) {
-      const textKey = getApiKey(sessionId, textAiConfig.provider);
+      const textKey = getApiKey(textAiConfig.provider);
       if (textKey) {
         prompt = await generateAutoPrompt(
           slideContext,

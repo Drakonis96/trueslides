@@ -50,6 +50,8 @@ export interface ImageAdjustment {
   offsetY: number;
   /** Image opacity percentage (0-100) */
   opacity?: number;
+  /** Fitting mode: cover (fill/crop), contain (fit whole), fill (stretch), none (original size) */
+  objectFit?: "cover" | "contain" | "fill" | "none";
 }
 
 // ── Slide ──
@@ -87,6 +89,7 @@ export interface ManualElementData {
   connectorColor?: string; // hex without #
   connectorWidth?: number; // px
   rotation?: number; // degrees, 0-360
+  thumbnailUrl?: string; // low-res preview for filmstrip (PPTX imports)
 }
 
 export interface SlideData {
@@ -105,6 +108,7 @@ export interface SlideData {
   overlayPosition?: { x: number; y: number }; // 0-100 % offset for title overlay on image-only slides
   manualElements?: ManualElementData[]; // when set, use exact element positions instead of layout-based rendering
   bgColor?: string; // hex without #, per-slide background (used by manual slides)
+  thumbnailUrl?: string; // low-res preview for filmstrip
 }
 
 export interface PresentationData {

@@ -3,6 +3,7 @@ import { AIProvider } from "@/lib/types";
 import { getApiKey } from "@/lib/key-store";
 import { getSessionId } from "@/lib/session";
 import { callAI, sanitizeErrorMessage } from "@/lib/ai-client";
+import { rateLimiters } from "@/lib/rate-limit";
 
 interface SlideVariantInput {
   title: string;
@@ -86,7 +87,16 @@ export async function POST(req: NextRequest) {
     const body: SlideVariantsRequest = await req.json();
 
     const sessionId = await getSessionId();
-    const apiKey = getApiKey(sessionId, body.provider);
+
+    const rl = rateLimiters.ai.check(sessionId);
+    if (!rl.allowed) {
+      return NextResponse.json(
+        { error: "Too many requests. Please wait before trying again." },
+        { status: 429, headers: { "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)) } }
+      );
+    }
+
+    const apiKey = getApiKey(body.provider);
 
     if (!apiKey) {
       return NextResponse.json({ error: "API key is required" }, { status: 400 });

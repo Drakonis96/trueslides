@@ -19,6 +19,16 @@ jest.mock("pdf-parse", () => {
   return { __esModule: true, default: fn };
 });
 
+jest.mock("@/lib/session", () => ({
+  getSessionId: jest.fn().mockResolvedValue("test-session-id"),
+}));
+
+jest.mock("@/lib/rate-limit", () => ({
+  rateLimiters: {
+    upload: { check: jest.fn().mockReturnValue({ allowed: true }) },
+  },
+}));
+
 import { POST } from "@/app/api/parse/route";
 import { NextRequest } from "next/server";
 

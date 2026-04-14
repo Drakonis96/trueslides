@@ -21,12 +21,15 @@ export type PresenterMessage =
 
 export function useBroadcastSender() {
   const channelRef = useRef<BroadcastChannel | null>(null);
+  const overlayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingOverlayRef = useRef<OverlayState | null>(null);
 
   useEffect(() => {
     channelRef.current = new BroadcastChannel(CHANNEL_NAME);
     return () => {
       channelRef.current?.close();
       channelRef.current = null;
+      if (overlayTimerRef.current) clearTimeout(overlayTimerRef.current);
     };
   }, []);
 
@@ -34,8 +37,17 @@ export function useBroadcastSender() {
     channelRef.current?.postMessage({ type: "slide-change", index } satisfies PresenterMessage);
   }, []);
 
+  /** Throttled overlay send: max ~30fps (33ms) to reduce BroadcastChannel + serialization pressure */
   const sendOverlay = useCallback((overlay: OverlayState) => {
-    channelRef.current?.postMessage({ type: "overlay-update", overlay } satisfies PresenterMessage);
+    pendingOverlayRef.current = overlay;
+    if (overlayTimerRef.current) return; // Already scheduled
+    overlayTimerRef.current = setTimeout(() => {
+      overlayTimerRef.current = null;
+      if (pendingOverlayRef.current) {
+        channelRef.current?.postMessage({ type: "overlay-update", overlay: pendingOverlayRef.current } satisfies PresenterMessage);
+        pendingOverlayRef.current = null;
+      }
+    }, 33);
   }, []);
 
   const sendVideoControl = useCallback((action: "play" | "pause") => {
@@ -108,12 +120,14 @@ export function useBroadcastInitProvider(payload: unknown | null) {
  */
 export function useBroadcastInitReceiver(): unknown | null {
   const [data, setData] = useState<unknown | null>(null);
+  const receivedRef = useRef(false);
 
   useEffect(() => {
     const channel = new BroadcastChannel(CHANNEL_NAME);
 
     channel.onmessage = (event: MessageEvent<PresenterMessage>) => {
-      if (event.data?.type === "init-data") {
+      if (event.data?.type === "init-data" && !receivedRef.current) {
+        receivedRef.current = true;
         setData(event.data.payload);
       }
     };

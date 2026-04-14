@@ -26,6 +26,12 @@ jest.mock("@/lib/state-store", () => ({
   setUserState: jest.fn(),
 }));
 
+jest.mock("@/lib/rate-limit", () => ({
+  rateLimiters: {
+    image: { check: jest.fn().mockReturnValue({ allowed: true }) },
+  },
+}));
+
 import { POST } from "@/app/api/images/route";
 import { callAI } from "@/lib/ai-client";
 import { getApiKey, getImageSourceKey } from "@/lib/key-store";
@@ -374,7 +380,7 @@ describe("POST /api/images", () => {
 
   it("should refine low-confidence queries across enabled keyed sources", async () => {
     (getApiKey as jest.Mock).mockReturnValue("test-ai-key");
-    (getImageSourceKey as jest.Mock).mockImplementation((_: string, source: string) =>
+    (getImageSourceKey as jest.Mock).mockImplementation((source: string) =>
       source === "pixabay" ? "pixabay-key" : null
     );
     (callAI as jest.Mock).mockResolvedValue(

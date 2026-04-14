@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { usePresenterRemoteClient } from "@/components/presenter/usePresenterRemote";
 import SlideRenderer from "@/components/presenter/SlideRenderer";
-import { OverlayRenderer } from "@/components/presenter/PresenterToolsOverlay";
+import { OverlayRenderer, MagnifierRenderer } from "@/components/presenter/PresenterToolsOverlay";
 import type { OverlayState } from "@/components/presenter/PresenterToolsOverlay";
 import type { SlideData } from "@/lib/types";
 import type { SessionStyleProps } from "@/lib/presenter-session";
@@ -22,21 +22,24 @@ import {
   Play,
   Pause,
   Trash2,
+  SlidersHorizontal,
+  Search,
 } from "lucide-react";
 
-type ToolType = "flashlight" | "draw" | "pointer";
+type ToolType = "flashlight" | "draw" | "pointer" | "magnifier";
 
-const ALL_TOOLS: ToolType[] = ["flashlight", "draw", "pointer"];
+const ALL_TOOLS: ToolType[] = ["flashlight", "draw", "pointer", "magnifier"];
 
 const TOOL_ICONS: Record<ToolType, React.ReactNode> = {
   flashlight: <Flashlight size={18} />,
   draw: <Pencil size={18} />,
   pointer: <Circle size={18} className="fill-red-500 text-red-500" />,
+  magnifier: <Search size={18} />,
 };
 
 const TOOL_LABELS: Record<string, Record<ToolType, string>> = {
-  en: { flashlight: "Spotlight", draw: "Draw", pointer: "Pointer" },
-  es: { flashlight: "Linterna", draw: "Dibujo", pointer: "Puntero" },
+  en: { flashlight: "Spotlight", draw: "Draw", pointer: "Pointer", magnifier: "Magnifier" },
+  es: { flashlight: "Linterna", draw: "Dibujo", pointer: "Puntero", magnifier: "Lupa" },
 };
 
 export default function RemotePage() {
@@ -50,14 +53,24 @@ export default function RemotePage() {
 
   // Active tool — which tool the user is currently using on the slide
   const [activeTool, setActiveTool] = useState<ToolType | null>(null);
+  // Tool sizes (fractions of slide width)
+  const [flashlightSize, setFlashlightSize] = useState(0.15);
+  const [pointerSize, setPointerSize] = useState(0.015);
+  const [drawSize, setDrawSize] = useState(0.004);
+  const [magnifierSize, setMagnifierSize] = useState(0.15);
+  const [magnifierZoom, setMagnifierZoom] = useState(2);
+  const [showSizeModal, setShowSizeModal] = useState(false);
   // Local overlay state (for rendering on the mobile slide preview)
   const [localOverlay, setLocalOverlay] = useState<OverlayState>({
     tool: "none", cursorX: 0.5, cursorY: 0.5, cursorActive: false,
     flashlightShape: "circle", flashlightSize: 0.15,
     pointerSize: 0.015, drawSize: 0.004, drawStrokes: [],
+    magnifierSize: 0.15, magnifierZoom: 2,
   });
   // Video playing state
   const [videoPlaying, setVideoPlaying] = useState(false);
+  // Landscape detection
+  const [isLandscape, setIsLandscape] = useState(false);
 
   // Full slides data (fetched once on connect)
   const [slides, setSlides] = useState<SlideData[] | null>(null);
@@ -67,9 +80,18 @@ export default function RemotePage() {
   const drawStrokesRef = useRef<Array<Array<{ x: number; y: number }>>>([]);
   const currentStrokeRef = useRef<Array<{ x: number; y: number }>>([]);
 
+  // Notes scroll container ref (to reset on slide change)
+  const notesScrollRef = useRef<HTMLDivElement>(null);
+
   // Slide container dimensions for rendering
   const slideContainerRef = useRef<HTMLDivElement>(null);
   const [slideDims, setSlideDims] = useState({ w: 320, h: 180 });
+
+  // Draggable split between slide area and notes area (portrait only)
+  // Value is the percentage of the available area (header to nav) given to the slide section
+  const [splitPct, setSplitPct] = useState(55);
+  const splitDragging = useRef(false);
+  const splitContainerRef = useRef<HTMLDivElement>(null);
 
   // Extract session ID from URL
   useEffect(() => {
@@ -80,6 +102,31 @@ export default function RemotePage() {
     }
     const navLang = navigator.language.toLowerCase();
     if (navLang.startsWith("es")) setLang("es");
+  }, []);
+
+  // Detect landscape orientation
+  useEffect(() => {
+    const mql = window.matchMedia("(orientation: landscape)");
+    setIsLandscape(mql.matches);
+    const handler = (e: MediaQueryListEvent) => setIsLandscape(e.matches);
+    mql.addEventListener("change", handler);
+    return () => mql.removeEventListener("change", handler);
+  }, []);
+
+  // Draggable split handle logic (portrait)
+  const handleSplitPointerDown = useCallback((e: React.PointerEvent) => {
+    e.preventDefault();
+    splitDragging.current = true;
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+  }, []);
+  const handleSplitPointerMove = useCallback((e: React.PointerEvent) => {
+    if (!splitDragging.current || !splitContainerRef.current) return;
+    const rect = splitContainerRef.current.getBoundingClientRect();
+    const pct = ((e.clientY - rect.top) / rect.height) * 100;
+    setSplitPct(Math.max(25, Math.min(75, pct)));
+  }, []);
+  const handleSplitPointerUp = useCallback(() => {
+    splitDragging.current = false;
   }, []);
 
   const {
@@ -116,9 +163,19 @@ export default function RemotePage() {
     const container = slideContainerRef.current;
     if (!container) return;
     const observer = new ResizeObserver((entries) => {
-      const { width } = entries[0].contentRect;
-      // Maintain 16:9 ratio
-      setSlideDims({ w: width, h: width * 9 / 16 });
+      const { width, height } = entries[0].contentRect;
+      // Reserve some padding so the slide doesn't touch edges
+      const availW = Math.max(0, width - 8);
+      const availH = Math.max(0, height - 8);
+      // Fit 16:9 within available space
+      const hFromWidth = availW * 9 / 16;
+      const wFromHeight = availH * 16 / 9;
+      // Use whichever dimension is the constraining one
+      if (hFromWidth <= availH) {
+        setSlideDims({ w: availW, h: hFromWidth });
+      } else {
+        setSlideDims({ w: wFromHeight, h: availH });
+      }
     });
     observer.observe(container);
     return () => observer.disconnect();
@@ -160,6 +217,8 @@ export default function RemotePage() {
       drawStrokesRef.current = [];
       currentStrokeRef.current = [];
       setLocalOverlay((prev) => ({ ...prev, drawStrokes: [], cursorActive: false }));
+      // Reset notes scroll to top
+      if (notesScrollRef.current) notesScrollRef.current.scrollTop = 0;
     }
   }, [session?.currentIndex]);
 
@@ -186,15 +245,16 @@ export default function RemotePage() {
       if (!next) {
         const cleared: OverlayState = {
           tool: "none", cursorX: 0.5, cursorY: 0.5, cursorActive: false,
-          flashlightShape: "circle", flashlightSize: 0.15,
-          pointerSize: 0.015, drawSize: 0.004, drawStrokes: drawStrokesRef.current,
+          flashlightShape: "circle", flashlightSize,
+          pointerSize, drawSize, drawStrokes: drawStrokesRef.current,
+          magnifierSize, magnifierZoom,
         };
         setLocalOverlay(cleared);
         sendCommand({ type: "overlay-update", overlay: cleared });
       }
       return next;
     });
-  }, [enabledTools, sendCommand]);
+  }, [enabledTools, sendCommand, flashlightSize, pointerSize, drawSize, magnifierSize, magnifierZoom]);
 
   // Send overlay update to presenter (throttled ~30fps with trailing send)
   const sendOverlayThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -234,11 +294,13 @@ export default function RemotePage() {
     cursorY: pos.y,
     cursorActive: active,
     flashlightShape: "circle",
-    flashlightSize: 0.15,
-    pointerSize: 0.015,
-    drawSize: 0.004,
+    flashlightSize,
+    pointerSize,
+    drawSize,
     drawStrokes: strokes ?? drawStrokesRef.current,
-  }), [activeTool]);
+    magnifierSize,
+    magnifierZoom,
+  }), [activeTool, flashlightSize, pointerSize, drawSize, magnifierSize, magnifierZoom]);
 
   const handleSlideTouchStart = useCallback((e: React.TouchEvent) => {
     if (!activeTool) return;
@@ -364,6 +426,29 @@ export default function RemotePage() {
     reorderTools(localToolOrder.filter((t) => enabledTools.has(t)));
   }, [localToolOrder, enabledTools, reorderTools]);
 
+  // Live-update overlay when a slider changes
+  const handleSizeChange = useCallback((setter: (v: number) => void, value: number, field?: string) => {
+    setter(value);
+    // Send an immediate overlay update so the presenter sees the change in real time
+    if (activeTool) {
+      const preview: OverlayState = {
+        tool: activeTool,
+        cursorX: 0.5,
+        cursorY: 0.5,
+        cursorActive: true,
+        flashlightShape: "circle",
+        flashlightSize: activeTool === "flashlight" ? value : flashlightSize,
+        pointerSize: activeTool === "pointer" ? value : pointerSize,
+        drawSize: activeTool === "draw" ? value : drawSize,
+        drawStrokes: drawStrokesRef.current,
+        magnifierSize: field === "magnifierSize" ? value : magnifierSize,
+        magnifierZoom: field === "magnifierZoom" ? value : magnifierZoom,
+      };
+      setLocalOverlay(preview);
+      sendCommand({ type: "overlay-update", overlay: preview });
+    }
+  }, [activeTool, flashlightSize, pointerSize, drawSize, magnifierSize, magnifierZoom, sendCommand]);
+
   const t = lang === "es"
     ? {
         title: "Control Remoto", connecting: "Conectando...", connected: "Conectado",
@@ -375,6 +460,7 @@ export default function RemotePage() {
         slide: "Diapositiva", of: "de", fontSize: "Tamaño de fuente",
         prev: "Anterior", next: "Siguiente",
         clearDraw: "Borrar dibujo", video: "Video",
+        toolSizes: "Tamaños", spotlight: "Linterna", pointer: "Puntero", drawing: "Dibujo", magnifier: "Lupa", zoom: "Zoom", close: "Cerrar",
       }
     : {
         title: "Remote Control", connecting: "Connecting...", connected: "Connected",
@@ -386,6 +472,7 @@ export default function RemotePage() {
         slide: "Slide", of: "of", fontSize: "Font size",
         prev: "Previous", next: "Next",
         clearDraw: "Clear drawing", video: "Video",
+        toolSizes: "Sizes", spotlight: "Spotlight", pointer: "Pointer", drawing: "Drawing", magnifier: "Magnifier", zoom: "Zoom", close: "Close",
       };
 
   // No session ID
@@ -471,39 +558,63 @@ export default function RemotePage() {
   const hasVideo = currentSlide?.hasVideo || false;
   const toolLabels = TOOL_LABELS[lang] || TOOL_LABELS.en;
 
-  return (
-    <div className="min-h-[100dvh] flex flex-col bg-gray-950 text-white select-none overflow-hidden">
-      {/* Header */}
-      <header className="flex items-center justify-between px-4 py-3 bg-gray-900 border-b border-gray-800 shrink-0 safe-area-top">
-        <div className="flex items-center gap-2 min-w-0">
-          {connected ? (
-            <Wifi size={16} className="text-emerald-400 shrink-0" />
-          ) : (
-            <WifiOff size={16} className="text-red-400 shrink-0 animate-pulse" />
-          )}
-          <span className="text-xs font-medium truncate max-w-[180px]">{session.presentationTitle}</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="text-xs font-mono text-gray-400">
-            {session.currentIndex + 1} / {session.totalSlides}
-          </span>
-          <button
-            onClick={() => setShowTools(!showTools)}
-            className={`p-2 rounded-lg transition-colors ${showTools ? "bg-blue-600" : "bg-gray-800 hover:bg-gray-700"}`}
-          >
-            <Settings size={16} />
-          </button>
-        </div>
-      </header>
-
-      {/* Slide preview with interactive tool overlay */}
-      <div className="px-3 pt-3 pb-1 shrink-0" ref={slideContainerRef}>
-        <div
-          className="relative w-full rounded-lg overflow-hidden border border-gray-800"
-          style={{ height: slideDims.h }}
+  // Shared sub-components to avoid duplication between layouts
+  const headerEl = (
+    <header className="flex items-center justify-between px-4 py-2 bg-gray-900 border-b border-gray-800 shrink-0 safe-area-top">
+      <div className="flex items-center gap-2 min-w-0">
+        {connected ? (
+          <Wifi size={14} className="text-emerald-400 shrink-0" />
+        ) : (
+          <WifiOff size={14} className="text-red-400 shrink-0 animate-pulse" />
+        )}
+        <span className="text-xs font-medium truncate max-w-[180px]">{session.presentationTitle}</span>
+      </div>
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-mono text-gray-400">
+          {session.currentIndex + 1} / {session.totalSlides}
+        </span>
+        <button
+          onClick={() => setShowTools(!showTools)}
+          className={`p-1.5 rounded-lg transition-colors ${showTools ? "bg-blue-600" : "bg-gray-800 hover:bg-gray-700"}`}
         >
-          {/* Render the actual slide */}
-          {currentSlideData && styleProps ? (
+          <Settings size={14} />
+        </button>
+      </div>
+    </header>
+  );
+
+  const slidePreviewEl = (
+    <div ref={slideContainerRef} className="w-full flex-1 flex items-center justify-center min-h-0">
+      <div
+        className="relative rounded-lg overflow-hidden border border-gray-800"
+        style={{ width: slideDims.w, height: slideDims.h }}
+      >
+        {currentSlideData && styleProps ? (
+          <SlideRenderer
+            slide={currentSlideData}
+            width={slideDims.w}
+            height={slideDims.h}
+            bgColor={styleProps.bgColor}
+            headingFont={styleProps.headingFont}
+            bodyFont={styleProps.bodyFont}
+            textDensity={styleProps.textDensity}
+            layoutMode={styleProps.layoutMode}
+            globalLayout={styleProps.globalLayout}
+            overlayTitleColor={styleProps.overlayTitleColor}
+            overlaySectionColor={styleProps.overlaySectionColor}
+          />
+        ) : (
+          <div className="w-full h-full bg-gray-800 flex items-center justify-center">
+            <span className="text-gray-500 text-sm">
+              {currentSlide?.title || (lang === "es" ? "Cargando diapositiva..." : "Loading slide...")}
+            </span>
+          </div>
+        )}
+        {activeTool && (
+          <OverlayRenderer state={localOverlay} width={slideDims.w} height={slideDims.h} />
+        )}
+        {activeTool === "magnifier" && currentSlideData && styleProps && (
+          <MagnifierRenderer state={localOverlay} width={slideDims.w} height={slideDims.h}>
             <SlideRenderer
               slide={currentSlideData}
               width={slideDims.w}
@@ -517,189 +628,427 @@ export default function RemotePage() {
               overlayTitleColor={styleProps.overlayTitleColor}
               overlaySectionColor={styleProps.overlaySectionColor}
             />
-          ) : (
-            <div className="w-full h-full bg-gray-800 flex items-center justify-center">
-              <span className="text-gray-500 text-sm">
-                {currentSlide?.title || (lang === "es" ? "Cargando diapositiva..." : "Loading slide...")}
-              </span>
-            </div>
-          )}
-
-          {/* Tool overlay canvas (shows flashlight/pointer/draw) */}
-          {activeTool && (
-            <OverlayRenderer
-              state={localOverlay}
-              width={slideDims.w}
-              height={slideDims.h}
-            />
-          )}
-
-          {/* Invisible interactive touch layer on top */}
-          <div
-            ref={slideInteractRef}
-            onTouchStart={handleSlideTouchStart}
-            onTouchMove={handleSlideTouchMove}
-            onTouchEnd={handleSlideTouchEnd}
-            onMouseDown={handleSlideMouseDown}
-            className={`absolute inset-0 z-20 ${activeTool ? "touch-none" : ""}`}
-            style={{ cursor: activeTool ? "crosshair" : "default" }}
-          />
-
-          {/* Active tool indicator badge */}
-          {activeTool && (
-            <div className="absolute top-2 left-2 z-30 flex items-center gap-1 px-2 py-1 rounded-lg bg-blue-600/80 text-xs font-medium pointer-events-none">
-              {TOOL_ICONS[activeTool]}
-              <span>{toolLabels[activeTool]}</span>
-            </div>
-          )}
-
-          {/* Clear draw button overlay */}
-          {activeTool === "draw" && drawStrokesRef.current.length > 0 && (
-            <button
-              onClick={handleClearDraw}
-              className="absolute top-2 right-2 z-30 p-1.5 rounded-lg bg-red-600/80 hover:bg-red-600 text-white"
-            >
-              <Trash2 size={14} />
-            </button>
-          )}
-        </div>
-
-        {/* Tool selector strip below slide */}
-        <div className="flex items-center justify-center gap-2 mt-2">
-          {ALL_TOOLS.filter((t) => enabledTools.has(t)).map((tool) => (
-            <button
-              key={tool}
-              onClick={() => handleActivateTool(tool)}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
-                activeTool === tool
-                  ? "bg-blue-600 text-white ring-1 ring-blue-400"
-                  : "bg-gray-800 text-gray-300 hover:bg-gray-700"
-              }`}
-            >
-              {TOOL_ICONS[tool]}
-              <span>{toolLabels[tool]}</span>
-            </button>
-          ))}
-          {hasVideo && (
-            <button
-              onClick={handleVideoToggle}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
-                videoPlaying
-                  ? "bg-red-600 text-white"
-                  : "bg-emerald-700 text-white hover:bg-emerald-600"
-              }`}
-            >
-              {videoPlaying ? <Pause size={14} /> : <Play size={14} />}
-              <span>{videoPlaying ? (lang === "es" ? "Pausa" : "Pause") : "Play"}</span>
-            </button>
-          )}
-        </div>
+          </MagnifierRenderer>
+        )}
+        <div
+          ref={slideInteractRef}
+          onTouchStart={handleSlideTouchStart}
+          onTouchMove={handleSlideTouchMove}
+          onTouchEnd={handleSlideTouchEnd}
+          onMouseDown={handleSlideMouseDown}
+          className={`absolute inset-0 z-20 ${activeTool ? "touch-none" : ""}`}
+          style={{ cursor: activeTool ? "crosshair" : "default" }}
+        />
+        {activeTool && (
+          <div className="absolute top-1.5 left-1.5 z-30 flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-blue-600/80 text-[10px] font-medium pointer-events-none">
+            {TOOL_ICONS[activeTool]}
+            <span>{toolLabels[activeTool]}</span>
+          </div>
+        )}
+        {activeTool === "draw" && drawStrokesRef.current.length > 0 && (
+          <button onClick={handleClearDraw}
+            className="absolute top-1.5 right-1.5 z-30 p-1 rounded-md bg-red-600/80 hover:bg-red-600 text-white">
+            <Trash2 size={12} />
+          </button>
+        )}
       </div>
+    </div>
+  );
 
-      {/* Expandable tools config panel */}
-      {showTools && (
-        <div className="bg-gray-900 border-y border-gray-800 px-4 py-3 animate-slideDown">
-          <h3 className="text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wider">{t.tools}</h3>
-          <div className="space-y-1">
-            {localToolOrder.map((tool, idx) => {
-              const isEnabled = enabledTools.has(tool);
-              const isActive = activeTool === tool;
-              return (
-                <div
-                  key={tool}
-                  draggable
-                  onDragStart={() => handleDragStart(idx)}
-                  onDragOver={(e) => { e.preventDefault(); handleDragOver(idx); }}
-                  onDragEnd={handleDragEnd}
-                  onTouchStart={(e) => handleTouchReorderStart(idx, e)}
-                  onTouchMove={handleTouchReorderMove}
-                  onTouchEnd={handleTouchReorderEnd}
-                  className={`flex items-center gap-3 px-3 py-3 rounded-xl transition-all ${
-                    isActive ? "bg-blue-900/60 ring-1 ring-blue-500" : isEnabled ? "bg-gray-800" : "bg-gray-800/40 opacity-50"
-                  } ${dragIdx === idx ? "scale-105 shadow-lg ring-2 ring-blue-500" : ""}`}
-                >
-                  <GripVertical size={16} className="text-gray-500 shrink-0 cursor-grab active:cursor-grabbing" />
-                  <button onClick={() => handleActivateTool(tool)}
-                    className={`shrink-0 p-1 rounded-lg transition-colors ${isActive ? "bg-blue-600 text-white" : isEnabled ? "text-gray-200" : "text-gray-600"}`}
-                    disabled={!isEnabled}>
-                    {TOOL_ICONS[tool]}
-                  </button>
-                  <button onClick={() => handleActivateTool(tool)}
-                    className={`text-sm font-medium flex-1 text-left ${!isEnabled ? "text-gray-600" : ""}`}
-                    disabled={!isEnabled}>
-                    {toolLabels[tool]}
-                    {isActive && <span className="ml-2 text-xs text-blue-400">({lang === "es" ? "activo" : "active"})</span>}
-                  </button>
-                  <button
-                    onClick={() => handleToggleTool(tool)}
-                    className={`w-12 h-7 rounded-full transition-colors relative ${isEnabled ? "bg-blue-600" : "bg-gray-600"}`}
-                  >
-                    <span className={`block w-5 h-5 rounded-full bg-white shadow transition-transform absolute top-1 ${isEnabled ? "translate-x-6" : "translate-x-1"}`} />
-                  </button>
-                </div>
-              );
-            })}
+  const toolStripEl = (
+    <div className={`flex items-center justify-center gap-1.5 ${isLandscape ? "mt-1.5" : "mt-2"}`}>
+      {ALL_TOOLS.filter((tl) => enabledTools.has(tl)).map((tool) => (
+        <button
+          key={tool}
+          onClick={() => handleActivateTool(tool)}
+          className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium transition-all ${
+            activeTool === tool
+              ? "bg-blue-600 text-white ring-1 ring-blue-400"
+              : "bg-gray-800 text-gray-300 hover:bg-gray-700"
+          }`}
+        >
+          {TOOL_ICONS[tool]}
+          <span>{toolLabels[tool]}</span>
+        </button>
+      ))}
+      {hasVideo && (
+        <button
+          onClick={handleVideoToggle}
+          className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium transition-all ${
+            videoPlaying ? "bg-red-600 text-white" : "bg-emerald-700 text-white hover:bg-emerald-600"
+          }`}
+        >
+          {videoPlaying ? <Pause size={12} /> : <Play size={12} />}
+          <span>{videoPlaying ? (lang === "es" ? "Pausa" : "Pause") : "Play"}</span>
+        </button>
+      )}
+      <button
+        onClick={() => setShowSizeModal(true)}
+        className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium transition-all bg-gray-800 text-gray-300 hover:bg-gray-700"
+      >
+        <SlidersHorizontal size={14} />
+      </button>
+    </div>
+  );
+
+  const toolsConfigEl = showTools ? (
+    <div className="bg-gray-900 border-y border-gray-800 px-3 py-2 animate-slideDown">
+      <h3 className="text-[10px] font-semibold text-gray-400 mb-1.5 uppercase tracking-wider">{t.tools}</h3>
+      <div className="space-y-1">
+        {localToolOrder.map((tool, idx) => {
+          const isEnabled = enabledTools.has(tool);
+          const isActive = activeTool === tool;
+          return (
+            <div
+              key={tool}
+              draggable
+              onDragStart={() => handleDragStart(idx)}
+              onDragOver={(e) => { e.preventDefault(); handleDragOver(idx); }}
+              onDragEnd={handleDragEnd}
+              onTouchStart={(e) => handleTouchReorderStart(idx, e)}
+              onTouchMove={handleTouchReorderMove}
+              onTouchEnd={handleTouchReorderEnd}
+              className={`flex items-center gap-2 px-2 py-2 rounded-xl transition-all ${
+                isActive ? "bg-blue-900/60 ring-1 ring-blue-500" : isEnabled ? "bg-gray-800" : "bg-gray-800/40 opacity-50"
+              } ${dragIdx === idx ? "scale-105 shadow-lg ring-2 ring-blue-500" : ""}`}
+            >
+              <GripVertical size={14} className="text-gray-500 shrink-0 cursor-grab active:cursor-grabbing" />
+              <button onClick={() => handleActivateTool(tool)}
+                className={`shrink-0 p-1 rounded-lg transition-colors ${isActive ? "bg-blue-600 text-white" : isEnabled ? "text-gray-200" : "text-gray-600"}`}
+                disabled={!isEnabled}>
+                {TOOL_ICONS[tool]}
+              </button>
+              <button onClick={() => handleActivateTool(tool)}
+                className={`text-sm font-medium flex-1 text-left ${!isEnabled ? "text-gray-600" : ""}`}
+                disabled={!isEnabled}>
+                {toolLabels[tool]}
+                {isActive && <span className="ml-2 text-xs text-blue-400">({lang === "es" ? "activo" : "active"})</span>}
+              </button>
+              <button
+                onClick={() => handleToggleTool(tool)}
+                className={`w-10 h-6 rounded-full transition-colors relative ${isEnabled ? "bg-blue-600" : "bg-gray-600"}`}
+              >
+                <span className={`block w-4 h-4 rounded-full bg-white shadow transition-transform absolute top-1 ${isEnabled ? "translate-x-5" : "translate-x-1"}`} />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  ) : null;
+
+  const sizeModalEl = showSizeModal ? (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setShowSizeModal(false)}>
+      <div className="bg-gray-900 rounded-2xl p-4 w-[280px] shadow-2xl border border-gray-700 animate-slideDown"
+        onClick={(e) => e.stopPropagation()}>
+        <h3 className="text-sm font-bold text-white mb-4 flex items-center gap-2">
+          <SlidersHorizontal size={16} />
+          {t.toolSizes}
+        </h3>
+        <div className="space-y-4">
+          {/* Flashlight / Spotlight size */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs text-gray-300 flex items-center gap-1.5">
+                <Flashlight size={13} /> {t.spotlight}
+              </span>
+              <span className="text-[10px] font-mono text-gray-500">{Math.round(flashlightSize * 100)}%</span>
+            </div>
+            <input type="range" min={0.05} max={0.4} step={0.01} value={flashlightSize}
+              onChange={(e) => handleSizeChange(setFlashlightSize, parseFloat(e.target.value))}
+              className="w-full h-1.5 bg-gray-700 rounded-full appearance-none cursor-pointer accent-blue-500" />
+          </div>
+          {/* Pointer size */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs text-gray-300 flex items-center gap-1.5">
+                <Circle size={13} className="fill-red-500 text-red-500" /> {t.pointer}
+              </span>
+              <span className="text-[10px] font-mono text-gray-500">{Math.round(pointerSize * 1000) / 10}%</span>
+            </div>
+            <input type="range" min={0.005} max={0.06} step={0.001} value={pointerSize}
+              onChange={(e) => handleSizeChange(setPointerSize, parseFloat(e.target.value))}
+              className="w-full h-1.5 bg-gray-700 rounded-full appearance-none cursor-pointer accent-red-500" />
+          </div>
+          {/* Draw size */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs text-gray-300 flex items-center gap-1.5">
+                <Pencil size={13} /> {t.drawing}
+              </span>
+              <span className="text-[10px] font-mono text-gray-500">{Math.round(drawSize * 1000) / 10}%</span>
+            </div>
+            <input type="range" min={0.001} max={0.02} step={0.001} value={drawSize}
+              onChange={(e) => handleSizeChange(setDrawSize, parseFloat(e.target.value))}
+              className="w-full h-1.5 bg-gray-700 rounded-full appearance-none cursor-pointer accent-amber-500" />
+          </div>
+          {/* Magnifier size */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs text-gray-300 flex items-center gap-1.5">
+                <Search size={13} /> {t.magnifier}
+              </span>
+              <span className="text-[10px] font-mono text-gray-500">{Math.round(magnifierSize * 100)}%</span>
+            </div>
+            <input type="range" min={0.05} max={0.3} step={0.01} value={magnifierSize}
+              onChange={(e) => handleSizeChange(setMagnifierSize, parseFloat(e.target.value), "magnifierSize")}
+              className="w-full h-1.5 bg-gray-700 rounded-full appearance-none cursor-pointer accent-indigo-500" />
+          </div>
+          {/* Magnifier zoom */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs text-gray-300 flex items-center gap-1.5">
+                <Search size={13} /> {t.zoom}
+              </span>
+              <span className="text-[10px] font-mono text-gray-500">{magnifierZoom.toFixed(1)}x</span>
+            </div>
+            <input type="range" min={1.5} max={5} step={0.1} value={magnifierZoom}
+              onChange={(e) => handleSizeChange(setMagnifierZoom, parseFloat(e.target.value), "magnifierZoom")}
+              className="w-full h-1.5 bg-gray-700 rounded-full appearance-none cursor-pointer accent-indigo-500" />
           </div>
         </div>
-      )}
+        <button onClick={() => setShowSizeModal(false)}
+          className="mt-4 w-full py-2 rounded-xl bg-gray-800 hover:bg-gray-700 text-sm font-medium transition-colors">
+          {t.close}
+        </button>
+      </div>
+    </div>
+  ) : null;
 
-      {/* Notes section */}
-      <div className="flex-1 overflow-y-auto px-4 py-3 min-h-0">
-        <div className="flex items-center justify-between mb-2">
-          <h2 className="text-sm font-semibold text-gray-300">{t.notes}</h2>
-          <div className="flex items-center gap-2">
+  const notesEl = (
+    <div className={`flex-1 flex flex-col min-h-0 ${isLandscape ? "" : ""}`}>
+      {/* Sticky header: slide info + font size controls */}
+      <div className={`shrink-0 bg-gray-950 z-10 ${isLandscape ? "px-3 pt-1 pb-0.5" : "px-4 pt-1.5 pb-0.5"}`}>
+        <div className="flex items-center justify-between mb-0.5">
+          <h2 className="text-[11px] font-semibold text-gray-300">{t.notes}</h2>
+          <div className="flex items-center gap-1">
             <button onClick={() => setNotesFontSize((s) => Math.max(10, s - 2))}
-              className="p-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 active:bg-gray-600 transition-colors">
-              <Minus size={14} />
+              className="p-0.5 rounded-md bg-gray-800 hover:bg-gray-700 active:bg-gray-600 transition-colors">
+              <Minus size={11} />
             </button>
-            <span className="text-xs font-mono text-gray-400 w-8 text-center">{notesFontSize}</span>
+            <span className="text-[9px] font-mono text-gray-400 w-5 text-center">{notesFontSize}</span>
             <button onClick={() => setNotesFontSize((s) => Math.min(36, s + 2))}
-              className="p-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 active:bg-gray-600 transition-colors">
-              <Plus size={14} />
+              className="p-0.5 rounded-md bg-gray-800 hover:bg-gray-700 active:bg-gray-600 transition-colors">
+              <Plus size={11} />
             </button>
           </div>
         </div>
         {currentSlide && (
-          <div className="mb-2 pb-2 border-b border-gray-800">
-            {currentSlide.section && <p className="text-xs text-blue-400 font-medium mb-1">{currentSlide.section}</p>}
-            <h3 className="text-base font-bold">{currentSlide.title}</h3>
+          <div className="pb-1 border-b border-gray-800">
+            {currentSlide.section && <p className="text-[10px] text-blue-400 font-medium leading-tight">{currentSlide.section}</p>}
+            <h3 className="text-[13px] font-bold leading-tight">{currentSlide.title}</h3>
           </div>
         )}
+      </div>
+      {/* Scrollable notes body */}
+      <div ref={notesScrollRef} className={`flex-1 overflow-y-auto min-h-0 ${isLandscape ? "px-3 pb-2" : "px-4 pb-3"}`}>
         {notes ? (
           <div className="leading-relaxed whitespace-pre-wrap text-gray-200"
             style={{ fontSize: notesFontSize, textAlign: "justify" }}>
             {notes}
           </div>
         ) : (
-          <p className="text-sm text-gray-500 italic">{t.noNotes}</p>
+          <p className="text-xs text-gray-500 italic">{t.noNotes}</p>
         )}
       </div>
+    </div>
+  );
 
-      {/* Navigation controls */}
-      <div className="px-4 py-3 bg-gray-900 border-t border-gray-800 shrink-0 safe-area-bottom">
+  const navEl = (
+    <div className={`bg-gray-900 border-t border-gray-800 shrink-0 safe-area-bottom ${isLandscape ? "px-2 py-1.5" : "px-4 py-3"}`}>
+      {!isLandscape && (
         <div className="flex justify-center mb-2">
           <div className="flex gap-1 overflow-x-auto max-w-full py-1 px-2">
-            {Array.from({ length: session.totalSlides }, (_, i) => (
-              <button key={i} onClick={() => goToSlide(i)}
-                className={`w-2 h-2 rounded-full shrink-0 transition-all ${
-                  i === session.currentIndex ? "bg-blue-500 scale-150" : "bg-gray-600 hover:bg-gray-400"
-                }`} />
-            ))}
+            {Array.from({ length: session.totalSlides }, (_, i) => {
+              const dist = Math.abs(i - session.currentIndex);
+              if (dist > 25) return null;
+              return (
+                <button key={i} onClick={() => goToSlide(i)}
+                  className={`w-2 h-2 rounded-full shrink-0 transition-colors ${
+                    i === session.currentIndex ? "bg-blue-500 scale-150" : "bg-gray-600 hover:bg-gray-400"
+                  }`} />
+              );
+            })}
           </div>
         </div>
-        <div className="flex gap-3">
-          <button onClick={prevSlide} disabled={session.currentIndex === 0}
-            className="flex-1 flex items-center justify-center gap-2 py-4 rounded-2xl bg-gray-800 hover:bg-gray-700 active:bg-gray-600 disabled:opacity-30 disabled:cursor-not-allowed transition-all text-lg font-semibold touch-manipulation">
-            <ChevronLeft size={24} />
-            <span className="hidden sm:inline">{t.prev}</span>
-          </button>
-          <button onClick={nextSlide} disabled={session.currentIndex === session.totalSlides - 1}
-            className="flex-1 flex items-center justify-center gap-2 py-4 rounded-2xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 disabled:opacity-30 disabled:cursor-not-allowed transition-all text-lg font-semibold touch-manipulation">
-            <span className="hidden sm:inline">{t.next}</span>
-            <ChevronRight size={24} />
-          </button>
+      )}
+      <div className={`flex gap-2 ${isLandscape ? "gap-1.5" : "gap-3"}`}>
+        <button onClick={prevSlide} disabled={session.currentIndex === 0}
+          className={`flex-1 flex items-center justify-center gap-1 rounded-2xl bg-gray-800 hover:bg-gray-700 active:bg-gray-600 disabled:opacity-30 disabled:cursor-not-allowed transition-all font-semibold touch-manipulation ${
+            isLandscape ? "py-2 text-sm rounded-xl" : "py-4 text-lg"
+          }`}>
+          <ChevronLeft size={isLandscape ? 18 : 24} />
+          <span className="hidden sm:inline">{t.prev}</span>
+        </button>
+        <button onClick={nextSlide} disabled={session.currentIndex === session.totalSlides - 1}
+          className={`flex-1 flex items-center justify-center gap-1 rounded-2xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 disabled:opacity-30 disabled:cursor-not-allowed transition-all font-semibold touch-manipulation ${
+            isLandscape ? "py-2 text-sm rounded-xl" : "py-4 text-lg"
+          }`}>
+          <span className="hidden sm:inline">{t.next}</span>
+          <ChevronRight size={isLandscape ? 18 : 24} />
+        </button>
+      </div>
+    </div>
+  );
+
+  // --- LANDSCAPE LAYOUT ---
+  if (isLandscape) {
+    return (
+      <div className="h-[100dvh] flex flex-col bg-gray-950 text-white select-none overflow-hidden">
+        {/* Slide preview — fills all space above the bottom bar */}
+        <div ref={slideContainerRef} className="flex-1 flex items-center justify-center min-h-0 overflow-hidden p-1">
+          <div
+            className="relative rounded-lg overflow-hidden border border-gray-800"
+            style={{ width: slideDims.w, height: slideDims.h }}
+          >
+            {currentSlideData && styleProps ? (
+              <SlideRenderer
+                slide={currentSlideData}
+                width={slideDims.w}
+                height={slideDims.h}
+                bgColor={styleProps.bgColor}
+                headingFont={styleProps.headingFont}
+                bodyFont={styleProps.bodyFont}
+                textDensity={styleProps.textDensity}
+                layoutMode={styleProps.layoutMode}
+                globalLayout={styleProps.globalLayout}
+                overlayTitleColor={styleProps.overlayTitleColor}
+                overlaySectionColor={styleProps.overlaySectionColor}
+              />
+            ) : (
+              <div className="w-full h-full bg-gray-800 flex items-center justify-center">
+                <span className="text-gray-500 text-sm">
+                  {currentSlide?.title || (lang === "es" ? "Cargando..." : "Loading...")}
+                </span>
+              </div>
+            )}
+            {activeTool && (
+              <OverlayRenderer state={localOverlay} width={slideDims.w} height={slideDims.h} />
+            )}
+            {activeTool === "magnifier" && currentSlideData && styleProps && (
+              <MagnifierRenderer state={localOverlay} width={slideDims.w} height={slideDims.h}>
+                <SlideRenderer
+                  slide={currentSlideData}
+                  width={slideDims.w}
+                  height={slideDims.h}
+                  bgColor={styleProps.bgColor}
+                  headingFont={styleProps.headingFont}
+                  bodyFont={styleProps.bodyFont}
+                  textDensity={styleProps.textDensity}
+                  layoutMode={styleProps.layoutMode}
+                  globalLayout={styleProps.globalLayout}
+                  overlayTitleColor={styleProps.overlayTitleColor}
+                  overlaySectionColor={styleProps.overlaySectionColor}
+                />
+              </MagnifierRenderer>
+            )}
+            <div
+              ref={slideInteractRef}
+              onTouchStart={handleSlideTouchStart}
+              onTouchMove={handleSlideTouchMove}
+              onTouchEnd={handleSlideTouchEnd}
+              onMouseDown={handleSlideMouseDown}
+              className={`absolute inset-0 z-20 ${activeTool ? "touch-none" : ""}`}
+              style={{ cursor: activeTool ? "crosshair" : "default" }}
+            />
+            {activeTool && (
+              <div className="absolute top-1 left-1 z-30 flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-blue-600/80 text-[10px] font-medium pointer-events-none">
+                {TOOL_ICONS[activeTool]}
+              </div>
+            )}
+            {activeTool === "draw" && drawStrokesRef.current.length > 0 && (
+              <button onClick={handleClearDraw}
+                className="absolute top-1 right-1 z-30 p-1 rounded-md bg-red-600/80 hover:bg-red-600 text-white">
+                <Trash2 size={12} />
+              </button>
+            )}
+          </div>
+        </div>
+        {/* Bottom bar: all centered — prev, tools, counter, next */}
+        <div className="px-2 py-1.5 bg-gray-900 border-t border-gray-800 shrink-0 safe-area-bottom">
+          <div className="flex items-center justify-center gap-2">
+            <button onClick={prevSlide} disabled={session.currentIndex === 0}
+              className="p-2.5 rounded-xl bg-gray-800 hover:bg-gray-700 active:bg-gray-600 disabled:opacity-30 disabled:cursor-not-allowed transition-all touch-manipulation">
+              <ChevronLeft size={20} />
+            </button>
+            {ALL_TOOLS.filter((tl) => enabledTools.has(tl)).map((tool) => (
+              <button
+                key={tool}
+                onClick={() => handleActivateTool(tool)}
+                className={`p-2 rounded-xl transition-all touch-manipulation ${
+                  activeTool === tool
+                    ? "bg-blue-600 text-white ring-1 ring-blue-400"
+                    : "bg-gray-800 text-gray-300 hover:bg-gray-700"
+                }`}
+              >
+                {TOOL_ICONS[tool]}
+              </button>
+            ))}
+            {hasVideo && (
+              <button
+                onClick={handleVideoToggle}
+                className={`p-2 rounded-xl transition-all touch-manipulation ${
+                  videoPlaying ? "bg-red-600 text-white" : "bg-emerald-700 text-white hover:bg-emerald-600"
+                }`}
+              >
+                {videoPlaying ? <Pause size={18} /> : <Play size={18} />}
+              </button>
+            )}
+            <button
+              onClick={() => setShowSizeModal(true)}
+              className="p-2 rounded-xl transition-all touch-manipulation bg-gray-800 text-gray-300 hover:bg-gray-700"
+            >
+              <SlidersHorizontal size={18} />
+            </button>
+            <span className="text-xs font-mono text-gray-400 px-1">
+              {session.currentIndex + 1}/{session.totalSlides}
+            </span>
+            <button onClick={nextSlide} disabled={session.currentIndex === session.totalSlides - 1}
+              className="p-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 disabled:opacity-30 disabled:cursor-not-allowed transition-all touch-manipulation">
+              <ChevronRight size={20} />
+            </button>
+          </div>
+        </div>
+
+        <style jsx>{`
+          .safe-area-bottom { padding-bottom: max(4px, env(safe-area-inset-bottom)); }
+        `}</style>
+        {sizeModalEl}
+      </div>
+    );
+  }
+
+  // --- PORTRAIT LAYOUT ---
+  return (
+    <div className="h-[100dvh] flex flex-col bg-gray-950 text-white select-none overflow-hidden">
+      {headerEl}
+
+      {/* Resizable split area between slide+tools and notes */}
+      <div ref={splitContainerRef} className="flex-1 flex flex-col min-h-0 overflow-hidden">
+        {/* Top: slide preview + tools */}
+        <div className="flex flex-col px-2 pt-2 pb-0 min-h-0" style={{ height: `${splitPct}%` }}>
+          {slidePreviewEl}
+          {toolStripEl}
+        </div>
+
+        {/* Draggable divider */}
+        <div
+          onPointerDown={handleSplitPointerDown}
+          onPointerMove={handleSplitPointerMove}
+          onPointerUp={handleSplitPointerUp}
+          className="shrink-0 flex items-center justify-center mt-1 py-1 cursor-row-resize touch-none z-10"
+        >
+          <div className="w-10 h-1 rounded-full bg-gray-600" />
+        </div>
+
+        {/* Bottom: notes */}
+        <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+          {toolsConfigEl}
+          {notesEl}
         </div>
       </div>
+
+      {navEl}
 
       <style jsx>{`
         .safe-area-top { padding-top: max(12px, env(safe-area-inset-top)); }
@@ -707,6 +1056,7 @@ export default function RemotePage() {
         @keyframes slideDown { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
         .animate-slideDown { animation: slideDown 0.2s ease-out; }
       `}</style>
+      {sizeModalEl}
     </div>
   );
 }

@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAppStore } from "@/lib/store";
 import { SlideData, ImageAdjustment, SLIDE_LAYOUTS, SlideLayoutId } from "@/lib/types";
-import { DEFAULT_IMAGE_ADJUSTMENT, getImageAdjustmentStyle, getMaxImageOffset, setSlideImageAdjustment } from "@/lib/image-adjustments";
+import { DEFAULT_IMAGE_ADJUSTMENT, getImageAdjustmentStyle, getMaxImageOffset, setSlideImageAdjustment, OBJECT_FIT_OPTIONS } from "@/lib/image-adjustments";
+import { getCachedBlob } from "@/lib/image-blob-cache";
 import {
   IconChevronLeft,
   IconChevronRight,
@@ -174,6 +175,40 @@ function ImageAdjuster({
           <IconReset size={14} />
         </button>
       </div>
+
+      {/* Fitting mode selector */}
+      <div className="space-y-1.5">
+        <span className="text-[10px] text-white/40 uppercase tracking-wider">
+          {lang === "en" ? "Fitting" : "Ajuste"}
+        </span>
+        <div className="grid grid-cols-4 gap-1">
+          {(["cover", "contain", "fill", "none"] as const).map((mode) => {
+            const labels: Record<string, { en: string; es: string; icon: string }> = {
+              cover:   { en: "Fill",     es: "Rellenar",  icon: "⊞" },
+              contain: { en: "Fit",      es: "Contener",  icon: "⊡" },
+              fill:    { en: "Stretch",  es: "Estirar",   icon: "⤢" },
+              none:    { en: "Original", es: "Original",  icon: "1:1" },
+            };
+            const info = labels[mode];
+            const isActive = (adj.objectFit || "cover") === mode;
+            return (
+              <button
+                key={mode}
+                onClick={() => onChange({ ...adj, objectFit: mode })}
+                className={`flex flex-col items-center gap-0.5 py-1.5 rounded-lg text-[10px] transition-colors ${
+                  isActive
+                    ? "bg-blue-500/30 text-blue-300 ring-1 ring-blue-400/40"
+                    : "bg-white/5 text-white/50 hover:bg-white/10 hover:text-white/70"
+                }`}
+                title={info[lang]}
+              >
+                <span className="text-sm leading-none">{info.icon}</span>
+                <span>{info[lang]}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
     </div>
   );
 }
@@ -199,6 +234,7 @@ function EditableText({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value);
   const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
+  const wrapperRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setDraft(value);
@@ -214,9 +250,17 @@ function EditableText({
   if (!editing) {
     return (
       <div
+        ref={wrapperRef}
+        tabIndex={disabled ? undefined : 0}
         className={`${disabled ? "cursor-default" : "cursor-text hover:ring-2 hover:ring-blue-400/40"} rounded px-1 -mx-1 transition-all ${className || ""}`}
         style={style}
         onClick={() => !disabled && setEditing(true)}
+        onKeyDown={(e) => {
+          if (!disabled && (e.key === "Enter" || e.key === " ")) {
+            e.preventDefault();
+            setEditing(true);
+          }
+        }}
       >
         {value || <span className="opacity-40 italic">{placeholder || "Click to edit"}</span>}
       </div>
@@ -227,6 +271,8 @@ function EditableText({
     const trimmed = draft.trim();
     if (trimmed !== value) onChange(trimmed);
     setEditing(false);
+    // Return focus to the wrapper element so it doesn't jump to document root
+    requestAnimationFrame(() => wrapperRef.current?.focus());
   };
 
   if (multiline) {
@@ -340,9 +386,32 @@ export default function FullscreenEditor({
   const [mode, setMode] = useState<EditorMode>("edit");
   const [activeTab, setActiveTab] = useState<PanelTab>(initialTab);
   const [selectedImageSlot, setSelectedImageSlot] = useState(initialImageSlot);
+  const [bgPickerColor, setBgPickerColor] = useState(() => {
+    const s = presentation?.slides[slideIndex];
+    return s?.bgColor || slideBgColor || "000000";
+  });
 
   const slide = presentation?.slides[slideIndex];
   const canvasRef = useRef<HTMLDivElement>(null);
+
+  // ── Resolve image URLs from blob cache for instant rendering ──
+  const [resolvedUrls, setResolvedUrls] = useState<Record<string, string>>({});
+  useEffect(() => {
+    let cancelled = false;
+    const urls = slide?.imageUrls.filter((u) => u && !u.startsWith("data:")) || [];
+    if (urls.length === 0) { setResolvedUrls({}); return; }
+    void (async () => {
+      const map: Record<string, string> = {};
+      await Promise.all(
+        urls.map(async (url) => {
+          const cached = await getCachedBlob(url);
+          if (cached && !cancelled) map[url] = cached;
+        }),
+      );
+      if (!cancelled) setResolvedUrls(map);
+    })();
+    return () => { cancelled = true; };
+  }, [slide?.imageUrls]);
 
   useEffect(() => {
     setActiveTab(initialTab);
@@ -351,6 +420,11 @@ export default function FullscreenEditor({
   useEffect(() => {
     setSelectedImageSlot(initialImageSlot);
   }, [initialImageSlot, slideIndex]);
+
+  // Sync bg picker color when switching slides
+  useEffect(() => {
+    setBgPickerColor(slide?.bgColor || slideBgColor || "000000");
+  }, [slideIndex, slide?.bgColor, slideBgColor]);
 
   // Move-mode dragging state for overlay
   const overlayDragging = useRef(false);
@@ -378,8 +452,9 @@ export default function FullscreenEditor({
     : "single";
   const layoutDef = SLIDE_LAYOUTS.find((l) => l.id === layoutId);
   const expectedImages = layoutDef?.imageCount ?? 1;
-  const bgHex = `#${slideBgColor || "FFFFFF"}`;
-  const bgIsDark = isDarkColor(slideBgColor || "FFFFFF");
+  const effectiveBg = slide?.bgColor || slideBgColor || "000000";
+  const bgHex = `#${effectiveBg}`;
+  const bgIsDark = isDarkColor(effectiveBg);
   const accent = slide?.accentColor ? `#${slide.accentColor}` : "#6366F1";
   const accentRaw = slide?.accentColor || "6366F1";
 
@@ -506,7 +581,7 @@ export default function FullscreenEditor({
 
   // ── Render image slot ──
   const renderImgSlot = (idx: number, className?: string, posStyle?: React.CSSProperties) => {
-    const url = slide.imageUrls[idx];
+    const url = resolvedUrls[slide.imageUrls[idx]] || slide.imageUrls[idx];
     if (!url) {
       return (
         <div
@@ -634,7 +709,7 @@ export default function FullscreenEditor({
                     onClick={() => { setSelectedImageSlot(0); setActiveTab("images"); }}
                   >
                     {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={slide.imageUrls[0]} alt="" className="w-full h-full pointer-events-none select-none" draggable={false} style={imageStyle(0)} />
+                    <img src={resolvedUrls[slide.imageUrls[0]] || slide.imageUrls[0]} alt="" className="w-full h-full pointer-events-none select-none" draggable={false} style={imageStyle(0)} />
                     <div className="absolute inset-0 bg-black/30" />
                     <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-black/20 flex items-center justify-center">
                       <span className="bg-black/60 text-white text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5">
@@ -814,11 +889,34 @@ export default function FullscreenEditor({
                   {lang === "en" ? "Apply accent to all slides" : "Aplicar acento a todas"}
                 </button>
                 <MiniColorPicker
-                  value={slideBgColor || "FFFFFF"}
+                  value={bgPickerColor}
                   presets={BG_PRESETS}
-                  onChange={setSlideBgColor}
+                  onChange={setBgPickerColor}
                   label={lang === "en" ? "Background" : "Fondo"}
                 />
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => {
+                      if (slide) updateSlide(slide.index, { bgColor: bgPickerColor });
+                    }}
+                    className="flex-1 py-1.5 rounded-lg text-[10px] font-medium bg-white/5 border border-white/10 text-white/60 hover:text-white hover:border-white/30 transition-colors"
+                  >
+                    {lang === "en" ? "Apply to this slide" : "Aplicar a esta"}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setSlideBgColor(bgPickerColor);
+                      if (presentation) {
+                        presentation.slides.forEach((s) => {
+                          updateSlide(s.index, { bgColor: undefined });
+                        });
+                      }
+                    }}
+                    className="flex-1 py-1.5 rounded-lg text-[10px] font-medium bg-white/5 border border-white/10 text-white/60 hover:text-white hover:border-white/30 transition-colors"
+                  >
+                    {lang === "en" ? "Apply to all" : "Aplicar a todas"}
+                  </button>
+                </div>
                 {isImageOnly && (
                   <>
                     <MiniColorPicker
@@ -859,7 +957,7 @@ export default function FullscreenEditor({
                 {expectedImages > 1 && (
                   <div className="grid grid-cols-4 gap-1.5">
                     {Array.from({ length: expectedImages }).map((_, i) => {
-                      const url = slide.imageUrls[i];
+                      const url = resolvedUrls[slide.imageUrls[i]] || slide.imageUrls[i];
                       return (
                         <button
                           key={i}
@@ -887,13 +985,33 @@ export default function FullscreenEditor({
                   </div>
                 )}
                 {slide.imageUrls[selectedImageSlot] ? (
-                  <ImageAdjuster
-                    url={slide.imageUrls[selectedImageSlot]}
-                    adj={getAdj(slide, selectedImageSlot)}
-                    onChange={(a) => updateImageAdj(selectedImageSlot, a)}
-                    onReset={() => resetImageAdj(selectedImageSlot)}
-                    lang={lang}
-                  />
+                  <>
+                    <ImageAdjuster
+                      url={resolvedUrls[slide.imageUrls[selectedImageSlot]] || slide.imageUrls[selectedImageSlot]}
+                      adj={getAdj(slide, selectedImageSlot)}
+                      onChange={(a) => updateImageAdj(selectedImageSlot, a)}
+                      onReset={() => resetImageAdj(selectedImageSlot)}
+                      lang={lang}
+                    />
+                    {/* Clear image slot */}
+                    <button
+                      onClick={() => {
+                        const newUrls = [...slide.imageUrls];
+                        newUrls[selectedImageSlot] = "";
+                        const newSources = [...(slide.imageSources || [])];
+                        newSources[selectedImageSlot] = "";
+                        updateSlide(slide.index, {
+                          imageUrls: newUrls,
+                          imageSources: newSources,
+                          imageAdjustments: setSlideImageAdjustment(slide, selectedImageSlot, DEFAULT_IMAGE_ADJUSTMENT),
+                        });
+                      }}
+                      className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg bg-red-500/10 text-red-400/80 hover:bg-red-500/20 hover:text-red-400 transition-colors text-xs"
+                    >
+                      <IconTrash size={12} />
+                      {lang === "en" ? "Clear image from slot" : "Vaciar imagen de la ranura"}
+                    </button>
+                  </>
                 ) : (
                   <div className="text-center py-8 text-white/30 text-xs">
                     <IconImage size={28} className="mx-auto mb-2" />

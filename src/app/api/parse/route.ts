@@ -1,16 +1,47 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getSessionId } from "@/lib/session";
+import { rateLimiters } from "@/lib/rate-limit";
 
 // Allow up to 60 seconds for large file parsing
 export const maxDuration = 60;
 
+// Maximum upload size: 50 MB
+const MAX_FILE_SIZE = 50 * 1024 * 1024;
+
 // Parse uploaded files (PDF, DOCX, TXT) and return extracted text
 export async function POST(req: NextRequest) {
   try {
+    const sessionId = await getSessionId();
+
+    const rl = rateLimiters.upload.check(sessionId);
+    if (!rl.allowed) {
+      return NextResponse.json(
+        { error: "Too many upload requests. Please wait before trying again." },
+        { status: 429, headers: { "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)) } }
+      );
+    }
+
+    // Check Content-Length before reading the body
+    const contentLength = Number(req.headers.get("content-length") ?? 0);
+    if (contentLength > MAX_FILE_SIZE) {
+      return NextResponse.json(
+        { error: `File too large. Maximum size is ${MAX_FILE_SIZE / 1024 / 1024}MB.` },
+        { status: 413 }
+      );
+    }
+
     const formData = await req.formData();
     const file = formData.get("file") as File | null;
 
     if (!file) {
       return NextResponse.json({ error: "No file provided" }, { status: 400 });
+    }
+
+    if (file.size > MAX_FILE_SIZE) {
+      return NextResponse.json(
+        { error: `File too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Maximum size is ${MAX_FILE_SIZE / 1024 / 1024}MB.` },
+        { status: 413 }
+      );
     }
 
     const name = file.name.toLowerCase();

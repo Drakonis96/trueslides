@@ -1,11 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getSessionId } from "@/lib/session";
 import { recordImageFeedback } from "@/lib/image-feedback";
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const sessionId = await getSessionId();
 
     if (!body?.action || !body?.imageUrl) {
       return NextResponse.json(
@@ -14,7 +12,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    recordImageFeedback(sessionId, {
+    recordImageFeedback({
       action: body.action,
       imageUrl: body.imageUrl,
       imageTitle: body.imageTitle,

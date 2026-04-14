@@ -24,6 +24,7 @@ export interface GenerateRequest {
 export interface GenerateResult {
   title: string;
   slides: (SlideData & { imageSearchTerms?: string[] })[];
+  warnings: string[];
 }
 
 type PartialSlide = {
@@ -203,6 +204,7 @@ function parseAIResponse(raw: string): GenerateResult {
 
   return {
     title: parsed.title,
+    warnings: [],
     slides: parsed.slides.map(
       (
         rawSlide: Record<string, unknown>,
@@ -595,6 +597,12 @@ async function generateSlidesChunked(
   const actualSlideCount = outline.slides.length;
   const totalChunks = Math.ceil(actualSlideCount / SLIDES_PER_CHUNK);
   const allSlides: GenerateResult["slides"] = [];
+  const warnings: string[] = [];
+
+  // Warn if outline is significantly shorter than requested
+  if (actualSlideCount < body.slideCount * 0.8) {
+    warnings.push(`Outline produced ${actualSlideCount}/${body.slideCount} slides (possible output truncation)`);
+  }
 
   console.log(`[generate] Outline received in ${((Date.now() - outlineStart) / 1000).toFixed(1)}s: "${outline.title}" — ${actualSlideCount} slides planned, ${totalChunks} chunks`);
 
@@ -642,7 +650,9 @@ async function generateSlidesChunked(
         },
       );
     } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
       console.warn(`[generate] Chunk ${chunkIdx + 1}/${totalChunks} call failed after ${((Date.now() - chunkCallStart) / 1000).toFixed(1)}s:`, err);
+      warnings.push(`Chunk ${chunkIdx + 1}/${totalChunks} (slides ${chunkStart + 1}–${chunkEnd}) failed: ${errMsg}`);
       chunkRaw = "";
     }
 
@@ -652,6 +662,7 @@ async function generateSlidesChunked(
 
     if (!chunkRaw.trim()) {
       console.warn(`[generate] Chunk ${chunkIdx + 1}/${totalChunks} empty — using outline fallback`);
+      warnings.push(`Chunk ${chunkIdx + 1}/${totalChunks} (slides ${chunkStart + 1}–${chunkEnd}) returned empty — using outline fallback`);
       for (let i = chunkStart; i < chunkEnd; i++) {
         const os = outline.slides[i];
         allSlides.push({
@@ -672,7 +683,9 @@ async function generateSlidesChunked(
     try {
       chunkSlides = parseChunkSlides(chunkRaw, outline.slides, chunkStart);
     } catch (parseErr) {
+      const parseErrMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
       console.warn(`[generate] Chunk ${chunkIdx + 1} parse failed:`, parseErr);
+      warnings.push(`Chunk ${chunkIdx + 1} parse failed: ${parseErrMsg} — using outline fallback`);
       chunkSlides = [];
       for (let i = chunkStart; i < chunkEnd; i++) {
         const os = outline.slides[i];
@@ -708,5 +721,5 @@ async function generateSlidesChunked(
     allSlides[i].index = i;
   }
 
-  return { title: outline.title, slides: allSlides };
+  return { title: outline.title, slides: allSlides, warnings };
 }

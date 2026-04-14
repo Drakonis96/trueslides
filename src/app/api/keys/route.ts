@@ -4,7 +4,6 @@ import {
   setApiKey, getApiKey, deleteApiKey, getKeyStatus,
   setImageSourceKey, deleteImageSourceKey, getImageSourceKeyStatus,
 } from "@/lib/key-store";
-import { getSessionId } from "@/lib/session";
 
 const VALID_PROVIDERS: AIProvider[] = ["openrouter", "gemini", "claude", "openai"];
 const VALID_IMAGE_SOURCES: ImageSourceId[] = IMAGE_SOURCES.filter((s) => s.needsKey).map((s) => s.id);
@@ -22,9 +21,8 @@ function isValidImageSource(source: string): source is ImageSourceId {
  */
 export async function GET() {
   try {
-    const sessionId = await getSessionId();
-    const status = getKeyStatus(sessionId);
-    const imageSourceStatus = getImageSourceKeyStatus(sessionId);
+    const status = getKeyStatus();
+    const imageSourceStatus = getImageSourceKeyStatus();
     return NextResponse.json({ status, imageSourceStatus });
   } catch (err: unknown) {
     console.error("Keys GET error:", err);
@@ -59,8 +57,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const sessionId = await getSessionId();
-
     if (imageSource) {
       if (!isValidImageSource(imageSource)) {
         return NextResponse.json(
@@ -68,7 +64,7 @@ export async function POST(req: NextRequest) {
           { status: 400 }
         );
       }
-      setImageSourceKey(sessionId, imageSource, apiKey.trim());
+      setImageSourceKey(imageSource, apiKey.trim());
       return NextResponse.json({ ok: true });
     }
 
@@ -79,7 +75,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    setApiKey(sessionId, provider, apiKey.trim());
+    setApiKey(provider, apiKey.trim());
     return NextResponse.json({ ok: true });
   } catch (err: unknown) {
     console.error("Keys POST error:", err);
@@ -99,8 +95,6 @@ export async function DELETE(req: NextRequest) {
     const body = await req.json();
     const { provider, imageSource } = body;
 
-    const sessionId = await getSessionId();
-
     if (imageSource) {
       if (!isValidImageSource(imageSource)) {
         return NextResponse.json(
@@ -108,7 +102,7 @@ export async function DELETE(req: NextRequest) {
           { status: 400 }
         );
       }
-      deleteImageSourceKey(sessionId, imageSource);
+      deleteImageSourceKey(imageSource);
       return NextResponse.json({ ok: true });
     }
 
@@ -119,7 +113,7 @@ export async function DELETE(req: NextRequest) {
       );
     }
 
-    deleteApiKey(sessionId, provider);
+    deleteApiKey(provider);
     return NextResponse.json({ ok: true });
   } catch (err: unknown) {
     console.error("Keys DELETE error:", err);

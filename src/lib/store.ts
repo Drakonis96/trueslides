@@ -180,32 +180,82 @@ interface AppState {
 // ── Debounced server save ──
 
 let _saveTimer: ReturnType<typeof setTimeout> | null = null;
-const SAVE_DEBOUNCE_MS = 1_000;
+/**
+ * Debounce delay for auto-saving state to server (ms).
+ * Increased from 1s to 3s to reduce serialization churn during rapid edits.
+ * History is still flushed immediately, but other state changes batch up.
+ */
+const SAVE_DEBOUNCE_MS = 3_000;
+
+/** Max history entries to prevent unbounded memory growth. Old entries are pruned on add. */
+const MAX_HISTORY_ENTRIES = 10;
+
+/**
+ * Strip heavy payload data from history entries before persisting to reduce
+ * serialization size and memory pressure.  Removes:
+ * - data: URIs from slide imageUrls (DALL-E generated, can be 500KB-2MB each)
+ * - imageBase64s from parsed PPTX notes projects (entire slide images)
+ */
+function lightenHistoryForPersist(history: HistoryEntry[]): HistoryEntry[] {
+  return history.map((entry) => {
+    let lite = entry;
+    // Strip data: URIs from presentation slides
+    if (lite.presentation) {
+      const lightSlides = lite.presentation.slides.map((s) => ({
+        ...s,
+        imageUrls: s.imageUrls.map((u) => (u.startsWith("data:") ? "" : u)),
+      }));
+      lite = { ...lite, presentation: { ...lite.presentation, slides: lightSlides } };
+    }
+    // Strip imageBase64s from notes-project parsed slides
+    if (lite.notesProject) {
+      const lightNSlides = lite.notesProject.slides.map((s) => ({
+        ...s,
+        imageBase64s: [] as string[],
+      }));
+      lite = { ...lite, notesProject: { ...lite.notesProject, slides: lightNSlides } };
+    }
+    return lite;
+  });
+}
+
+// Keys of state that get persisted to server.
+// Listed explicitly so the subscriber can do reference comparison per field
+// instead of JSON.stringify-ing the entire partial on every state change.
+const PERSISTED_KEYS: (keyof AppState)[] = [
+  "settings",
+  "selectedProvider",
+  "selectedModelId",
+  "layoutMode",
+  "customPresets",
+  "slideBgColor",
+  "slideAccentColor",
+  "selectedTheme",
+  "headingFontFamily",
+  "bodyFontFamily",
+  "headingFontFace",
+  "bodyFontFace",
+  "overlaySectionFontSize",
+  "overlayTitleFontSize",
+  "overlaySectionColor",
+  "overlayTitleColor",
+  "overlayTextGap",
+  "history",
+  "notesOutputLanguage",
+  "showImageSource",
+  "imageSourceFontColor",
+];
 
 function getPartialState(state: AppState): Record<string, unknown> {
-  return {
-    settings: state.settings,
-    selectedProvider: state.selectedProvider,
-    selectedModelId: state.selectedModelId,
-    layoutMode: state.layoutMode,
-    customPresets: state.customPresets,
-    slideBgColor: state.slideBgColor,
-    slideAccentColor: state.slideAccentColor,
-    selectedTheme: state.selectedTheme,
-    headingFontFamily: state.headingFontFamily,
-    bodyFontFamily: state.bodyFontFamily,
-    headingFontFace: state.headingFontFace,
-    bodyFontFace: state.bodyFontFace,
-    overlaySectionFontSize: state.overlaySectionFontSize,
-    overlayTitleFontSize: state.overlayTitleFontSize,
-    overlaySectionColor: state.overlaySectionColor,
-    overlayTitleColor: state.overlayTitleColor,
-    overlayTextGap: state.overlayTextGap,
-    history: state.history,
-    notesOutputLanguage: state.notesOutputLanguage,
-    showImageSource: state.showImageSource,
-    imageSourceFontColor: state.imageSourceFontColor,
-  };
+  const partial: Record<string, unknown> = {};
+  for (const key of PERSISTED_KEYS) {
+    partial[key] = state[key];
+  }
+  // Lighten history before serialization to avoid multi-MB JSON payloads
+  if (partial.history) {
+    partial.history = lightenHistoryForPersist(partial.history as HistoryEntry[]);
+  }
+  return partial;
 }
 
 function migrateServerState(raw: Record<string, unknown>): Record<string, unknown> {
@@ -363,7 +413,7 @@ export const useAppStore = create<AppState>()(
       layoutMode: "fixed",
       slideLayout: "single",
       stretchImages: false,
-      slideBgColor: "FFFFFF",
+      slideBgColor: "000000",
       slideAccentColor: "B30333",
       selectedTheme: DEFAULT_THEME_PACK_ID,
       headingFontFamily: "'Inter', 'Helvetica Neue', Arial, sans-serif",
@@ -529,7 +579,10 @@ export const useAppStore = create<AppState>()(
       // ── History ──
       history: [],
       addToHistory: (entry) => {
-        set((s) => ({ history: [entry, ...s.history] }));
+        set((s) => ({
+          // Keep max 50 entries; drop oldest entries beyond limit to prevent unbounded growth
+          history: [entry, ...s.history].slice(0, MAX_HISTORY_ENTRIES),
+        }));
         // Flush immediately so history survives HMR / page reloads
         get()._saveToServer(true);
       },
@@ -690,15 +743,30 @@ export const useAppStore = create<AppState>()(
     })
 );
 
-// Subscribe to state changes and auto-save persistable fields to server
-let _prevPartial: string | null = null;
+// Subscribe to state changes and auto-save persistable fields to server.
+// Uses per-field reference equality to skip serialization when only transient
+// state (status, progress, presentation preview, UI flags) changed.
+let _prevRefs: Record<string, unknown> = {};
 useAppStore.subscribe((state) => {
   if (!state._serverLoaded) return;
-  const partial = JSON.stringify(getPartialState(state));
-  if (partial !== _prevPartial) {
-    _prevPartial = partial;
-    state._saveToServer();
+
+  // Quick check: did any persisted field reference change?
+  let changed = false;
+  for (const key of PERSISTED_KEYS) {
+    if (state[key] !== _prevRefs[key]) {
+      changed = true;
+      break;
+    }
   }
+  if (!changed) return;
+
+  // Snapshot current references
+  const refs: Record<string, unknown> = {};
+  for (const key of PERSISTED_KEYS) {
+    refs[key] = state[key];
+  }
+  _prevRefs = refs;
+  state._saveToServer();
 });
 
 export function useHydration() {

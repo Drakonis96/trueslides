@@ -302,10 +302,24 @@ export function usePresenterRemoteClient(sessionId: string | null) {
     };
   }, [sessionId]);
 
-  /** Send a command to the presenter */
+  /** Send a command to the presenter — overlay updates use an in-flight guard
+   *  so concurrent POSTs don't pile up and cause network congestion. */
+  const overlayInFlightRef = useRef(false);
+  const pendingOverlayCmdRef = useRef<SessionCommand | null>(null);
+
   const sendCommand = useCallback(async (command: SessionCommand) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
+
+    // For overlay-update commands, queue only the latest and skip if one is already in-flight
+    if (command.type === "overlay-update") {
+      if (overlayInFlightRef.current) {
+        pendingOverlayCmdRef.current = command;
+        return;
+      }
+      overlayInFlightRef.current = true;
+    }
+
     try {
       const resp = await fetch("/api/presenter-remote/command", {
         method: "POST",
@@ -321,6 +335,16 @@ export function usePresenterRemoteClient(sessionId: string | null) {
       }
     } catch {
       // Network error - SSE will handle reconnection
+    } finally {
+      if (command.type === "overlay-update") {
+        overlayInFlightRef.current = false;
+        // Flush the latest pending overlay if one queued while we were in-flight
+        const pending = pendingOverlayCmdRef.current;
+        if (pending) {
+          pendingOverlayCmdRef.current = null;
+          sendCommand(pending);
+        }
+      }
     }
   }, []);
 
@@ -328,12 +352,12 @@ export function usePresenterRemoteClient(sessionId: string | null) {
   const prevSlide = useCallback(() => sendCommand({ type: "slide-prev" }), [sendCommand]);
   const goToSlide = useCallback((index: number) => sendCommand({ type: "slide-change", index }), [sendCommand]);
   const toggleTool = useCallback(
-    (tool: "flashlight" | "draw" | "pointer", enabled: boolean) =>
+    (tool: "flashlight" | "draw" | "pointer" | "magnifier", enabled: boolean) =>
       sendCommand({ type: "tool-toggle", tool, enabled }),
     [sendCommand],
   );
   const reorderTools = useCallback(
-    (tools: Array<"flashlight" | "draw" | "pointer">) =>
+    (tools: Array<"flashlight" | "draw" | "pointer" | "magnifier">) =>
       sendCommand({ type: "tools-reorder", tools }),
     [sendCommand],
   );

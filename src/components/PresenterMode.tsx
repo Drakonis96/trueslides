@@ -14,6 +14,7 @@ interface PresenterModeProps {
   /** If true, this instance is the audience-only window */
   isAudienceWindow?: boolean;
   initialIndex?: number;
+  onUpdateNotes?: (slideIndex: number, notes: string) => void;
   onExit: () => void;
 }
 
@@ -22,6 +23,7 @@ export default function PresenterMode({
   presentationTitle,
   isAudienceWindow = false,
   initialIndex = 0,
+  onUpdateNotes,
   onExit,
 }: PresenterModeProps) {
   const bgColor = useAppStore((s) => s.slideBgColor) || "FFFFFF";
@@ -105,8 +107,7 @@ export default function PresenterMode({
       layoutMode={layoutMode}
       globalLayout={globalLayout}
       overlayTitleColor={overlayTitleColor}
-      overlaySectionColor={overlaySectionColor}
-      onExit={handleExit}
+      overlaySectionColor={overlaySectionColor}      onUpdateNotes={onUpdateNotes}      onExit={handleExit}
     />
   );
 }

@@ -1,9 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useManualStore, ManualSlide, ManualSlideElement, ManualLayoutId, PREDEFINED_TEMPLATES, PredefinedTemplateId } from "@/lib/manual-store";
+import { useManualStore, ManualSlide, ManualSlideElement, ManualPresentation, ManualLayoutId, PREDEFINED_TEMPLATES, PredefinedTemplateId } from "@/lib/manual-store";
 import { useAppStore } from "@/lib/store";
-import { DEFAULT_IMAGE_ADJUSTMENT, getImageAdjustmentStyle, getMaxImageOffset } from "@/lib/image-adjustments";
+import { DEFAULT_IMAGE_ADJUSTMENT, getImageAdjustmentStyle, getMaxImageOffset, OBJECT_FIT_OPTIONS } from "@/lib/image-adjustments";
+import { prefetchImageBlob, getCachedBlobAsBase64, setCachedBlob } from "@/lib/image-blob-cache";
 import { UI_TEXT } from "@/lib/presets";
 import { LAYOUT_LABELS, LayoutThumbnail } from "./LayoutSelector";
 import {
@@ -11,9 +12,12 @@ import {
   IconFullscreen, IconMinimize, IconSparkles, IconLoader,
   IconChevronLeft, IconChevronRight, IconType,
   IconPencil, IconDownload, IconSettings, IconMove, IconUpload,
-  IconZoomIn, IconZoomOut, IconCheck, IconWarning, IconSave,
+  IconZoomIn, IconZoomOut, IconCheck, IconWarning, IconSave, IconImageOff,
 } from "./Icons";
 import ImageSearchModal from "./ImageSearchModal";
+import AINotesModal from "./AINotesModal";
+import ConfirmModal from "./ConfirmModal";
+import PptxImportModal from "./PptxImportModal";
 import { Undo2, Redo2, ChevronUp, ChevronDown, Layers, Presentation } from "lucide-react";
 import { SLIDE_LAYOUTS, PresentationData, SlideData, ShapeKind, ConnectorStyle, ArrowHead } from "@/lib/types";
 import ReactMarkdown from "react-markdown";
@@ -52,7 +56,7 @@ const CONNECTOR_STYLES: { id: ConnectorStyle; label: { en: string; es: string };
 const MANUAL_LAYOUTS = SLIDE_LAYOUTS;
 
 function layoutLabel(id: ManualLayoutId, lang: "en" | "es"): string {
-  return LAYOUT_LABELS[id][lang];
+  return LAYOUT_LABELS[id]?.[lang] ?? id;
 }
 
 function MarkdownText({ content, className }: { content: string; className?: string }) {
@@ -342,7 +346,7 @@ function SlideThumbnail({ slide, index, isSelected, isMultiSelected, onClick }: 
           }}
         >
           {el.type === "image" && el.content ? (
-            <img src={el.content} alt="" className="w-full h-full" style={getImageAdjustmentStyle(el.imageAdjustment)} />
+            <img src={el.thumbnailUrl || el.content} alt="" className="w-full h-full" style={getImageAdjustmentStyle(el.imageAdjustment)} />
           ) : el.type === "image" ? (
             <div className="w-full h-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center">
               <IconImage size={8} className="text-gray-400" />
@@ -427,7 +431,7 @@ function CanvasElement({ element, isSelected, scale, onSelect, onUpdate, onDoubl
   }, [isEditing]);
 
   const readFileAsDataUrl = useCallback((file: File) => {
-    if (!file.type.startsWith("image/")) return;
+    if (!file.type.startsWith("image/") && file.type !== "") return;
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === "string") onImageDrop?.(reader.result);
@@ -435,18 +439,76 @@ function CanvasElement({ element, isSelected, scale, onSelect, onUpdate, onDoubl
     reader.readAsDataURL(file);
   }, [onImageDrop]);
 
+  const fetchExternalImageAsDataUrl = useCallback(async (url: string) => {
+    // data: URLs can be used directly
+    if (url.startsWith("data:image/")) {
+      onImageDrop?.(url);
+      return;
+    }
+    try {
+      const res = await fetch(`/api/image-proxy?url=${encodeURIComponent(url)}`);
+      if (!res.ok) return;
+      const blob = await res.blob();
+      if (!blob.type.startsWith("image/")) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === "string") onImageDrop?.(reader.result);
+      };
+      reader.readAsDataURL(blob);
+    } catch { /* ignore fetch errors */ }
+  }, [onImageDrop]);
+
+  const extractImageUrl = useCallback((e: React.DragEvent): string | null => {
+    // Decode HTML entities (&amp; &lt; &gt; &quot; &#39; &#xNN;)
+    const decodeHtmlEntities = (s: string) =>
+      s.replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
+       .replace(/&quot;/gi, '"').replace(/&#39;/g, "'")
+       .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+       .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(Number(dec)));
+
+    // 1. Try text/html first — <img src> is most reliable for cross-browser image drags
+    const html = e.dataTransfer.getData("text/html");
+    if (html) {
+      const m = html.match(/<img[^>]+src=["']([^"']+)["']/i);
+      if (m?.[1]) {
+        const src = decodeHtmlEntities(m[1]);
+        if (src.startsWith("data:image/")) return src;
+        if (/^https?:\/\//i.test(src)) return src;
+      }
+    }
+    // 2. Try text/uri-list
+    const uriList = e.dataTransfer.getData("text/uri-list");
+    if (uriList) {
+      const firstUrl = uriList.split(/\r?\n/).find(l => l && !l.startsWith("#"));
+      if (firstUrl && /^https?:\/\//i.test(firstUrl)) return firstUrl;
+    }
+    // 3. Try text/plain if it looks like an image URL
+    const plain = e.dataTransfer.getData("text/plain");
+    if (plain && /^https?:\/\/\S+/i.test(plain.trim())) {
+      return plain.trim();
+    }
+    return null;
+  }, []);
+
   const handleFileDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setIsDragOver(false);
     if (element.type !== "image") return;
+    // Prefer local image files
     const file = e.dataTransfer.files?.[0];
+    if (file && file.type.startsWith("image/")) { readFileAsDataUrl(file); return; }
+    // Try extracting a URL from the drag data
+    const url = extractImageUrl(e);
+    if (url) { fetchExternalImageAsDataUrl(url); return; }
+    // Last resort: try file even without MIME type (some browsers omit it)
     if (file) readFileAsDataUrl(file);
-  }, [element.type, readFileAsDataUrl]);
+  }, [element.type, readFileAsDataUrl, extractImageUrl, fetchExternalImageAsDataUrl]);
 
   const handleFileDragOver = useCallback((e: React.DragEvent) => {
     if (element.type !== "image") return;
-    if (e.dataTransfer.types.includes("Files")) {
+    const types = e.dataTransfer.types;
+    if (types.includes("Files") || types.includes("text/uri-list") || types.includes("text/html")) {
       e.preventDefault();
       e.stopPropagation();
       setIsDragOver(true);
@@ -650,6 +712,13 @@ function CanvasElement({ element, isSelected, scale, onSelect, onUpdate, onDoubl
                   title="Upload image"
                 >
                   <IconUpload size={13} />
+                </button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); onUpdate({ content: "", imageSource: undefined, imageAdjustment: undefined }); }}
+                  className="p-1.5 rounded-md bg-black/60 hover:bg-red-600/80 text-white transition-colors"
+                  title="Clear image"
+                >
+                  <IconImageOff size={13} />
                 </button>
               </div>
             )}
@@ -1132,6 +1201,39 @@ function ImageCropControls({
         <span>{lang === "en" ? "Drag to reframe" : "Arrastra para reencuadrar"}</span>
       </div>
 
+      {/* Fitting mode selector */}
+      <div className="space-y-1.5">
+        <span className="text-[var(--muted)]">{lang === "en" ? "Fitting" : "Ajuste"}</span>
+        <div className="grid grid-cols-4 gap-1">
+          {(["cover", "contain", "fill", "none"] as const).map((mode) => {
+            const labels: Record<string, { en: string; es: string; icon: string }> = {
+              cover:   { en: "Fill",     es: "Rellenar",  icon: "⊞" },
+              contain: { en: "Fit",      es: "Contener",  icon: "⊡" },
+              fill:    { en: "Stretch",  es: "Estirar",   icon: "⤢" },
+              none:    { en: "Original", es: "Original",  icon: "1:1" },
+            };
+            const info = labels[mode];
+            const isActive = (adjustment.objectFit || "cover") === mode;
+            return (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => onUpdate({ imageAdjustment: { ...adjustment, objectFit: mode } })}
+                className={`flex flex-col items-center gap-0.5 py-1.5 rounded-lg text-[10px] transition-colors ${
+                  isActive
+                    ? "bg-[var(--accent)]/20 text-[var(--accent)] ring-1 ring-[var(--accent)]/30"
+                    : "bg-[var(--surface-2)] text-[var(--muted)] hover:bg-[var(--border)] hover:text-[var(--fg)]"
+                }`}
+                title={info[lang]}
+              >
+                <span className="text-sm leading-none">{info.icon}</span>
+                <span>{info[lang]}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       <label className="flex flex-col gap-1">
         <span className="text-[var(--muted)]">
           {lang === "en" ? "Transparency" : "Transparencia"} ({Math.round(100 - (adjustment.opacity ?? 100))}%)
@@ -1511,21 +1613,92 @@ function manualToPresentationData(title: string, slides: ManualSlide[]): Present
 
 async function downloadImageAsBase64(url: string): Promise<string | null> {
   if (url.startsWith("data:")) return url;
-  try {
-    const proxyUrl = new URL("/api/image-proxy", window.location.origin);
-    proxyUrl.searchParams.set("url", url);
-    const res = await fetch(proxyUrl.toString());
-    if (!res.ok) return null;
-    const blob = await res.blob();
-    return new Promise((resolve, reject) => {
+  // Check blob cache first — converts Blob to base64 on demand
+  const cached = await getCachedBlobAsBase64(url);
+  if (cached) return cached;
+
+  const blobToDataUri = (blob: Blob): Promise<string> =>
+    new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result as string);
       reader.onerror = () => reject(reader.error);
       reader.readAsDataURL(blob);
     });
-  } catch {
-    return null;
+
+  // Retry with exponential backoff (handles 429 rate-limiting)
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      const proxyUrl = new URL("/api/image-proxy", window.location.origin);
+      proxyUrl.searchParams.set("url", url);
+      const res = await fetch(proxyUrl.toString());
+      if (res.status === 429) {
+        const retryAfter = Number(res.headers.get("Retry-After") || 0);
+        const waitMs = retryAfter ? retryAfter * 1000 : 1000 * Math.pow(2, attempt);
+        await new Promise((r) => setTimeout(r, Math.min(waitMs, 10_000)));
+        continue;
+      }
+      if (!res.ok) {
+        if (attempt < MAX_ATTEMPTS - 1) {
+          await new Promise((r) => setTimeout(r, 500 * Math.pow(2, attempt)));
+          continue;
+        }
+        // All proxy attempts failed — try direct browser fetch as last resort.
+        // The browser can pass Cloudflare JS challenges that the server proxy cannot.
+        break;
+      }
+      const blob = await res.blob();
+      void setCachedBlob(url, blob);
+      return blobToDataUri(blob);
+    } catch {
+      if (attempt < MAX_ATTEMPTS - 1) {
+        await new Promise((r) => setTimeout(r, 500 * Math.pow(2, attempt)));
+        continue;
+      }
+      break;
+    }
   }
+
+  // Fallback: direct browser fetch (bypasses Cloudflare challenges, CORS permitting)
+  try {
+    const directRes = await fetch(url);
+    if (directRes.ok) {
+      const blob = await directRes.blob();
+      if (blob.type.startsWith("image/")) {
+        void setCachedBlob(url, blob);
+        return blobToDataUri(blob);
+      }
+    }
+  } catch { /* CORS or network error */ }
+
+  // Last resort: capture the image from the DOM if it's already rendered in a slide preview.
+  // <img> tags can display cross-origin images that fetch() cannot access due to CORS.
+  // We draw the already-loaded <img> element to a canvas to extract its pixel data.
+  try {
+    const imgs = document.querySelectorAll<HTMLImageElement>("img");
+    for (const img of imgs) {
+      if (img.src === url && img.naturalWidth > 0 && img.complete) {
+        const canvas = document.createElement("canvas");
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.drawImage(img, 0, 0);
+          try {
+            const dataUri = canvas.toDataURL("image/jpeg", 0.92);
+            if (dataUri && dataUri.length > 100) {
+              void setCachedBlob(url, await (await fetch(dataUri)).blob());
+              canvas.width = 0; canvas.height = 0;
+              return dataUri;
+            }
+          } catch { /* tainted canvas — CORS blocked pixel access */ }
+          canvas.width = 0; canvas.height = 0;
+        }
+        break;
+      }
+    }
+  } catch { /* DOM access error */ }
+  return null;
 }
 
 async function preDownloadManualImages(
@@ -1583,6 +1756,8 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
   const setManualTab = appStore.setManualSubTab;
 
   const [showLayoutPicker, setShowLayoutPicker] = useState(false);
+  const [addSlideCount, setAddSlideCount] = useState(1);
+  const [hoverInsertIndex, setHoverInsertIndex] = useState<number | null>(null);
   const [showChangeLayoutPopup, setShowChangeLayoutPopup] = useState(false);
   const [showShapePicker, setShowShapePicker] = useState(false);
   const [showConnectorPicker, setShowConnectorPicker] = useState(false);
@@ -1593,6 +1768,7 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
   const [savedFlash, setSavedFlash] = useState(false);
   const [editingElement, setEditingElement] = useState<string | null>(null);
   const [generatingNotes, setGeneratingNotes] = useState(false);
+  const [showAINotesModal, setShowAINotesModal] = useState(false);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
   const [dragSourceIndex, setDragSourceIndex] = useState<number | null>(null);
   const [noteDraft, setNoteDraft] = useState("");
@@ -1606,8 +1782,14 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
   const [selectedSlideIndices, setSelectedSlideIndices] = useState<Set<number>>(new Set());
   const [selectedElementIds, setSelectedElementIds] = useState<Set<string>>(new Set());
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [confirmModal, setConfirmModal] = useState<{ title: string; message: string; danger?: boolean; onConfirm: () => void } | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [pptxImportOpen, setPptxImportOpen] = useState(false);
+  const [importingNotes, setImportingNotes] = useState(false);
   const lastClickedSlideIndex = useRef<number | null>(null);
   const clipboardRef = useRef<ManualSlideElement[]>([]);
+  const pptxInputRef = useRef<HTMLInputElement>(null);
+  const notesImportRef = useRef<HTMLInputElement>(null);
 
   const slides = store.presentation.slides;
   const activeCreation = store.creations.find((creation) => creation.id === store.activeCreationId) || null;
@@ -1622,7 +1804,8 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
 
   useEffect(() => {
     setNoteDraft(currentSlide?.notes || "");
-  }, [currentSlide?.id, currentSlide?.notes]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSlide?.id]);
 
   useEffect(() => {
     setTitleDraft(store.presentation.title || "");
@@ -1796,47 +1979,18 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
   }, [store, selectedSlideIndices]);
 
   const handleAddSlide = useCallback((layout: ManualLayoutId) => {
-    store.addSlide(layout);
+    store.addSlide(layout, addSlideCount);
     setShowLayoutPicker(false);
+  }, [store, addSlideCount]);
+
+  const handleOpenAINotesModal = useCallback(() => {
+    setShowAINotesModal(true);
+  }, []);
+
+  const handleAINotesSave = useCallback((notes: string) => {
+    setNoteDraft(notes);
+    store.updateSlideNotes(store.selectedSlideIndex, notes);
   }, [store]);
-
-  const handleGenerateNotes = useCallback(async () => {
-    if (!currentSlide || generatingNotes) return;
-    const { provider, modelId } = appStore.getEffectiveSelection();
-    const provConfig = appStore.settings.providers.find((p) => p.id === provider);
-    if (!provConfig?.hasKey || !modelId) return;
-
-    setGeneratingNotes(true);
-    try {
-      const slideContent = currentSlide.elements
-        .map((el) => el.type !== "image" ? el.content : "")
-        .filter(Boolean)
-        .join("\n");
-
-      const res = await fetch("/api/generate-notes", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          provider,
-          modelId,
-          slideContent,
-          slideTitle: currentSlide.elements.find((el) => el.type === "title")?.content || "",
-          outputLanguage: appStore.settings.outputLanguage,
-        }),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        const generatedNotes = data.notes || "";
-        setNoteDraft(generatedNotes);
-        store.updateSlideNotes(store.selectedSlideIndex, generatedNotes);
-      }
-    } catch (err) {
-      console.error("Failed to generate notes:", err);
-    } finally {
-      setGeneratingNotes(false);
-    }
-  }, [currentSlide, generatingNotes, appStore, store]);
 
   const handleImageSelected = useCallback((image: { url: string; source: string }, slotIndex: number) => {
     if (!store.imageSearchTargetElementId) return;
@@ -1846,6 +2000,8 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
       imageAdjustment: { ...DEFAULT_IMAGE_ADJUSTMENT },
     });
     store.setShowImageSearch(false);
+    // Pre-download image blob in background for faster rendering & PPTX export
+    prefetchImageBlob(image.url);
   }, [store]);
 
   const handleSlideDragStart = (e: React.DragEvent, index: number) => {
@@ -2050,6 +2206,212 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
     setManualTab("editor");
   }, [store]);
 
+  /** Called by PptxImportModal with already-converted ManualPresentation */
+  const handlePptxModalImport = useCallback(
+    (presentation: ManualPresentation) => {
+      store.importCreation(presentation);
+      setManualTab("editor");
+    },
+    [store, setManualTab]
+  );
+
+  const handleImportPptx = useCallback(async (file: File) => {
+    if (importing) return;
+    setImporting(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("/api/parse-pptx", { method: "POST", body: formData });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: "Unknown error" }));
+        alert(err.error || (lang === "en" ? "Failed to parse PPTX" : "Error al procesar el PPTX"));
+        return;
+      }
+      const data = await res.json();
+
+      interface ParsedShapeData {
+        type: "text" | "image" | "table";
+        x: number; y: number; w: number; h: number;
+        paragraphs?: { runs: { text: string; bold?: boolean; fontSize?: number; color?: string; fontFamily?: string }[]; alignment?: string; isBullet?: boolean }[];
+        imageBase64?: string;
+        fontSize?: number;
+        fontWeight?: "normal" | "bold";
+        fontFamily?: string;
+        color?: string;
+        textAlign?: "left" | "center" | "right" | "justify";
+      }
+
+      interface ParsedSlideData {
+        texts: string[];
+        imageBase64s: string[];
+        presenterNotes: string;
+        shapes?: ParsedShapeData[];
+        bgColor?: string;
+      }
+
+      const importedSlides: ManualSlide[] = (data.slides || []).map((ps: ParsedSlideData) => {
+        const elements: ManualSlideElement[] = [];
+        let zIndex = 1;
+
+        // Use rich shape data if available
+        if (ps.shapes && ps.shapes.length > 0) {
+          for (const shape of ps.shapes) {
+            if (shape.type === "image" && shape.imageBase64) {
+              elements.push({
+                id: crypto.randomUUID(),
+                type: "image",
+                x: shape.x,
+                y: shape.y,
+                w: shape.w,
+                h: shape.h,
+                content: shape.imageBase64,
+                fontSize: 14,
+                zIndex: zIndex++,
+              });
+            } else if (shape.type === "text" && shape.paragraphs) {
+              // Build text content from paragraphs
+              const lines = shape.paragraphs.map(p =>
+                p.runs.map(r => r.text).join("")
+              );
+              const content = lines.join("\n");
+              if (!content.trim()) continue;
+
+              // Determine element type based on formatting heuristics
+              const isBigBold = (shape.fontSize && shape.fontSize >= 28) || shape.fontWeight === "bold";
+              const hasBullets = shape.paragraphs.some(p => p.isBullet);
+              const isFirstShape = elements.filter(e => e.type !== "image").length === 0;
+              let elType: ManualSlideElement["type"] = "text";
+              if (isBigBold && isFirstShape && !hasBullets) {
+                elType = "title";
+              } else if (hasBullets || lines.length > 2) {
+                elType = "bullets";
+              }
+
+              elements.push({
+                id: crypto.randomUUID(),
+                type: elType,
+                x: shape.x,
+                y: shape.y,
+                w: shape.w,
+                h: shape.h,
+                content,
+                fontSize: shape.fontSize || (elType === "title" ? 32 : 18),
+                fontWeight: shape.fontWeight || (elType === "title" ? "bold" : "normal"),
+                fontFamily: shape.fontFamily,
+                color: shape.color || "FFFFFF",
+                textAlign: shape.textAlign,
+                zIndex: zIndex++,
+              });
+            }
+          }
+        } else {
+          // Fallback: old flat import (for backward compatibility)
+          if (ps.texts.length > 0) {
+            elements.push({
+              id: crypto.randomUUID(),
+              type: "title",
+              x: 4, y: 4, w: 92, h: 12,
+              content: ps.texts[0],
+              fontSize: 32, fontWeight: "bold", color: "FFFFFF",
+              zIndex: zIndex++,
+            });
+          }
+          if (ps.texts.length > 1) {
+            elements.push({
+              id: crypto.randomUUID(),
+              type: "bullets",
+              x: 4, y: 18, w: ps.imageBase64s.length > 0 ? 50 : 92, h: 60,
+              content: ps.texts.slice(1).join("\n"),
+              fontSize: 18,
+              zIndex: zIndex++,
+            });
+          }
+          ps.imageBase64s.forEach((imgData: string, imgIdx: number) => {
+            elements.push({
+              id: crypto.randomUUID(),
+              type: "image",
+              x: ps.texts.length > 1 ? 56 : 10 + imgIdx * 25,
+              y: 18,
+              w: ps.texts.length > 1 ? 40 : 42,
+              h: 60,
+              content: imgData,
+              fontSize: 14,
+              zIndex: zIndex++,
+            });
+          });
+        }
+
+        // Fallback: at least one empty element so the slide isn't blank
+        if (elements.length === 0) {
+          elements.push({
+            id: crypto.randomUUID(),
+            type: "text",
+            x: 10, y: 40, w: 80, h: 20,
+            content: lang === "en" ? "(empty slide)" : "(diapositiva vacía)",
+            fontSize: 18,
+            zIndex: 1,
+          });
+        }
+        return {
+          id: crypto.randomUUID(),
+          layout: "single" as ManualLayoutId,
+          elements,
+          notes: ps.presenterNotes || "",
+          bgColor: ps.bgColor || "1E293B",
+          accentColor: "6366F1",
+        };
+      });
+      const presentation: ManualPresentation = {
+        title: (data.fileName || "Imported Deck").replace(/\.pptx$/i, ""),
+        slides: importedSlides,
+      };
+      store.importCreation(presentation);
+      setManualTab("editor");
+    } catch (err) {
+      console.error("PPTX import error:", err);
+      alert(lang === "en" ? "Failed to import PPTX file" : "Error al importar el archivo PPTX");
+    } finally {
+      setImporting(false);
+      if (pptxInputRef.current) pptxInputRef.current.value = "";
+    }
+  }, [importing, lang, store, setManualTab]);
+
+  const handleImportNotes = useCallback(async (file: File) => {
+    if (importingNotes || slides.length === 0) return;
+    setImportingNotes(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("/api/parse-pptx", { method: "POST", body: formData });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: "Unknown error" }));
+        alert(err.error || (lang === "en" ? "Failed to parse PPTX" : "Error al procesar el PPTX"));
+        return;
+      }
+      const data = await res.json();
+      const importedSlides: { presenterNotes: string }[] = data.slides || [];
+      if (importedSlides.length !== slides.length) {
+        alert(
+          lang === "en"
+            ? `Slide count mismatch: the imported file has ${importedSlides.length} slide(s) but the current presentation has ${slides.length}.`
+            : `El número de diapositivas no coincide: el archivo importado tiene ${importedSlides.length} diapositiva(s) pero la presentación actual tiene ${slides.length}.`
+        );
+        return;
+      }
+      for (let i = 0; i < importedSlides.length; i++) {
+        const notes = (importedSlides[i].presenterNotes || "").trim();
+        store.updateSlideNotes(i, notes);
+      }
+      setNoteDraft(slides[store.selectedSlideIndex] ? (importedSlides[store.selectedSlideIndex]?.presenterNotes || "").trim() : "");
+    } catch (err) {
+      console.error("Notes import error:", err);
+      alert(lang === "en" ? "Failed to import notes" : "Error al importar las notas");
+    } finally {
+      setImportingNotes(false);
+      if (notesImportRef.current) notesImportRef.current.value = "";
+    }
+  }, [importingNotes, slides, lang, store]);
+
   const handleDownloadPptx = useCallback(async () => {
     if (downloading || slides.length === 0) return;
     setDownloading(true);
@@ -2126,12 +2488,23 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
             <h3 className="text-sm font-semibold">
               {lang === "en" ? "Manual Creations" : "Creaciones Manuales"}
             </h3>
-            <button
-              onClick={handleCreateCreation}
-              className="flex items-center gap-1.5 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded-lg px-3 py-1.5 text-xs font-medium transition-colors"
-            >
-              <IconPlus size={12} /> {lang === "en" ? "New Creation" : "Nueva Creación"}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleCreateCreation}
+                className="flex items-center gap-1.5 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded-lg px-3 py-1.5 text-xs font-medium transition-colors"
+              >
+                <IconPlus size={12} /> {lang === "en" ? "New Creation" : "Nueva Creación"}
+              </button>
+              <button
+                onClick={() => setPptxImportOpen(true)}
+                disabled={importing}
+                className="flex items-center gap-1.5 border border-[var(--accent)]/60 text-[var(--accent)] hover:bg-[var(--accent)]/10 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50"
+              >
+                {importing
+                  ? <><IconLoader size={12} className="animate-spin" /> {lang === "en" ? "Importing..." : "Importando..."}</>
+                  : <><IconUpload size={12} /> {lang === "en" ? "Import PPTX" : "Importar PPTX"}</>}
+              </button>
+            </div>
           </div>
 
           {store.creations.length === 0 ? (
@@ -2211,9 +2584,15 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            if (confirm(lang === "en" ? "Delete this manual creation?" : "¿Eliminar esta creación manual?")) {
-                              store.deleteCreation(creation.id);
-                            }
+                            setConfirmModal({
+                              title: lang === "en" ? "Delete" : "Eliminar",
+                              message: lang === "en" ? "Delete this manual creation?" : "¿Eliminar esta creación manual?",
+                              danger: true,
+                              onConfirm: () => {
+                                store.deleteCreation(creation.id);
+                                setConfirmModal(null);
+                              },
+                            });
                           }}
                           className="p-1.5 rounded-lg hover:bg-red-500/10 text-[var(--muted)] hover:text-red-400 transition-colors"
                           title={lang === "en" ? "Delete" : "Eliminar"}
@@ -2284,6 +2663,25 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
           {downloading ? <IconLoader size={16} className="animate-spin" /> : <IconDownload size={16} />}
         </button>
 
+        <button
+          onClick={() => notesImportRef.current?.click()}
+          disabled={importingNotes || slides.length === 0}
+          className="p-2 rounded-lg bg-[var(--surface-2)] hover:bg-[var(--border)] transition-colors disabled:opacity-50"
+          title={lang === "en" ? "Import notes from PPTX" : "Importar notas desde PPTX"}
+        >
+          {importingNotes ? <IconLoader size={16} className="animate-spin" /> : <IconUpload size={16} />}
+        </button>
+        <input
+          ref={notesImportRef}
+          type="file"
+          accept=".pptx"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) handleImportNotes(file);
+          }}
+        />
+
         {/* Add slide dropdown */}
         <div className="relative">
           <button
@@ -2295,13 +2693,44 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
           </button>
           {showLayoutPicker && (
             <div className="absolute top-full left-0 mt-1 z-50 bg-[var(--surface)] border border-[var(--border)] rounded-xl shadow-xl p-3 w-72">
+              {/* Slide count stepper */}
+              <div className="flex items-center justify-between mb-3 pb-2 border-b border-[var(--border)]">
+                <span className="text-xs font-semibold text-[var(--muted)]">
+                  {lang === "en" ? "How many?" : "¿Cuántas?"}
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={() => setAddSlideCount((c) => Math.max(1, c - 1))}
+                    className="w-6 h-6 rounded-md bg-[var(--surface-2)] border border-[var(--border)] hover:border-[var(--accent)] text-xs font-bold text-[var(--fg)] transition-colors flex items-center justify-center"
+                  >
+                    −
+                  </button>
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={addSlideCount}
+                    onChange={(e) => {
+                      const v = Math.max(1, Math.min(50, Number(e.target.value) || 1));
+                      setAddSlideCount(v);
+                    }}
+                    className="w-10 h-6 text-center text-xs font-semibold bg-[var(--surface-2)] border border-[var(--border)] rounded-md outline-none focus:border-[var(--accent)] [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                  />
+                  <button
+                    onClick={() => setAddSlideCount((c) => Math.min(50, c + 1))}
+                    className="w-6 h-6 rounded-md bg-[var(--surface-2)] border border-[var(--border)] hover:border-[var(--accent)] text-xs font-bold text-[var(--fg)] transition-colors flex items-center justify-center"
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
               {/* Predefined templates */}
               <p className="text-xs font-semibold text-[var(--muted)] mb-2">{lang === "en" ? "Templates" : "Plantillas"}</p>
               <div className="grid grid-cols-2 gap-2 mb-3">
                 {PREDEFINED_TEMPLATES.map((tmpl) => (
                   <button
                     key={tmpl.id}
-                    onClick={() => { store.addSlideFromTemplate(tmpl.id); setShowLayoutPicker(false); }}
+                    onClick={() => { store.addSlideFromTemplate(tmpl.id, addSlideCount); setShowLayoutPicker(false); }}
                     className="flex items-center gap-2 p-2 rounded-lg border border-[var(--border)] hover:border-[var(--accent)] hover:bg-[var(--accent)]/5 transition-colors text-left"
                   >
                     <span className="text-lg">{tmpl.icon}</span>
@@ -2515,10 +2944,26 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
       ) : (
         <div className="flex gap-3" style={{ minHeight: 500 }}>
           {/* Slide list sidebar */}
-          <div className="w-32 shrink-0 space-y-0 overflow-y-auto max-h-[calc(100vh-250px)] pr-1">
+          <div className="w-32 shrink-0 space-y-0 overflow-y-auto max-h-[calc(100vh-250px)] pr-1" onMouseLeave={() => setHoverInsertIndex(null)}>
             {slides.map((slide, i) => (
               <div key={slide.id} className="relative">
-                {/* Insertion line before this slide */}
+                {/* Hover insert zone before this slide */}
+                <div
+                  className="relative h-2 -my-1 z-10 flex items-center justify-center cursor-pointer group/insert"
+                  onMouseEnter={() => setHoverInsertIndex(i)}
+                  onMouseLeave={(e) => {
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const isInside = e.clientY >= rect.top && e.clientY <= rect.bottom;
+                    if (!isInside) setHoverInsertIndex(null);
+                  }}
+                  onClick={(e) => { e.stopPropagation(); store.insertSlideAt(i, "single"); setHoverInsertIndex(null); }}
+                >
+                  <div className={`absolute inset-x-1 h-0.5 rounded-full transition-all ${hoverInsertIndex === i ? "bg-[var(--accent)] shadow-[0_0_4px_var(--accent)]" : "bg-transparent"}`} />
+                  <div className={`relative z-10 w-4 h-4 rounded-full flex items-center justify-center text-white text-[10px] font-bold transition-all ${hoverInsertIndex === i ? "bg-[var(--accent)] scale-100 opacity-100" : "scale-0 opacity-0"}`}>
+                    +
+                  </div>
+                </div>
+                {/* Insertion line before this slide (drag) */}
                 {dragOverIndex === i && dragSourceIndex !== null && dragSourceIndex !== i && dragSourceIndex !== i - 1 && (
                   <div className="h-0.5 bg-[var(--accent)] rounded-full mx-1 -mt-px mb-0.5 shadow-[0_0_4px_var(--accent)]" />
                 )}
@@ -2549,7 +2994,16 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (confirm(t.manualDeleteSlideConfirm)) store.deleteSlide(i);
+                      const slideIdx = i;
+                      setConfirmModal({
+                        title: lang === "en" ? "Delete slide" : "Eliminar diapositiva",
+                        message: t.manualDeleteSlideConfirm,
+                        danger: true,
+                        onConfirm: () => {
+                          store.deleteSlide(slideIdx);
+                          setConfirmModal(null);
+                        },
+                      });
                     }}
                     className="p-0.5 rounded bg-white/90 dark:bg-black/70 text-[var(--muted)] hover:text-red-400"
                     title={t.manualDeleteSlide}
@@ -2583,6 +3037,22 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
               </div>
               </div>
             ))}
+            {/* Hover insert zone after all slides */}
+            <div
+              className="relative h-2 -my-1 z-10 flex items-center justify-center cursor-pointer group/insert"
+              onMouseEnter={() => setHoverInsertIndex(slides.length)}
+              onMouseLeave={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const isInside = e.clientY >= rect.top && e.clientY <= rect.bottom;
+                if (!isInside) setHoverInsertIndex(null);
+              }}
+              onClick={(e) => { e.stopPropagation(); store.insertSlideAt(slides.length, "single"); setHoverInsertIndex(null); }}
+            >
+              <div className={`absolute inset-x-1 h-0.5 rounded-full transition-all ${hoverInsertIndex === slides.length ? "bg-[var(--accent)] shadow-[0_0_4px_var(--accent)]" : "bg-transparent"}`} />
+              <div className={`relative z-10 w-4 h-4 rounded-full flex items-center justify-center text-white text-[10px] font-bold transition-all ${hoverInsertIndex === slides.length ? "bg-[var(--accent)] scale-100 opacity-100" : "scale-0 opacity-0"}`}>
+                +
+              </div>
+            </div>
             {/* Add slide button at bottom of sidebar */}
             <button
               onClick={() => setShowLayoutPicker(!showLayoutPicker)}
@@ -2801,12 +3271,11 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
                       <p className="text-[11px] text-[var(--muted)]">{t.manualNotesHint}</p>
                     </div>
                     <button
-                      onClick={handleGenerateNotes}
-                      disabled={generatingNotes}
-                      className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-[var(--surface-2)] hover:bg-[var(--border)] disabled:opacity-50 transition-colors"
+                      onClick={handleOpenAINotesModal}
+                      className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-[var(--surface-2)] hover:bg-[var(--border)] transition-colors"
                     >
-                      {generatingNotes ? <IconLoader size={12} className="animate-spin" /> : <IconSparkles size={12} />}
-                      {generatingNotes ? t.manualGeneratingNotes : t.manualGenerateNotes}
+                      <IconSparkles size={12} />
+                      {t.manualGenerateNotes}
                     </button>
                   </div>
                   <textarea
@@ -3016,8 +3485,24 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
               });
             }
             store.setShowImageSearch(false);
+            prefetchImageBlob(image.url);
           }}
           onClose={() => store.setShowImageSearch(false)}
+        />
+      )}
+
+      {/* AI Notes modal */}
+      {showAINotesModal && currentSlide && (
+        <AINotesModal
+          slideContent={currentSlide.elements
+            .map((el) => el.type !== "image" ? el.content : "")
+            .filter(Boolean)
+            .join("\n")}
+          slideTitle={currentSlide.elements.find((el) => el.type === "title")?.content || ""}
+          existingNotes={currentSlide.notes || ""}
+          lang={lang}
+          onSave={handleAINotesSave}
+          onClose={() => setShowAINotesModal(false)}
         />
       )}
 
@@ -3069,6 +3554,24 @@ export default function ManualCreator({ onPresent }: { onPresent?: () => void })
       )}
       </>
       )}
+
+      <ConfirmModal
+        open={!!confirmModal}
+        title={confirmModal?.title ?? ""}
+        message={confirmModal?.message ?? ""}
+        danger={confirmModal?.danger}
+        confirmLabel={lang === "es" ? "Confirmar" : "Confirm"}
+        cancelLabel={lang === "es" ? "Cancelar" : "Cancel"}
+        onConfirm={() => confirmModal?.onConfirm()}
+        onCancel={() => setConfirmModal(null)}
+      />
+
+      <PptxImportModal
+        open={pptxImportOpen}
+        onClose={() => setPptxImportOpen(false)}
+        onImport={handlePptxModalImport}
+      />
+
     </div>
   );
 }
@@ -3086,7 +3589,7 @@ function ManualFullscreenEditor({ slide, slideIndex, onClose }: {
   const canvasRef = useRef<HTMLDivElement>(null);
   const [canvasScale, setCanvasScale] = useState(1);
   const [editingElement, setEditingElement] = useState<string | null>(null);
-  const [generatingNotes, setGeneratingNotes] = useState(false);
+  const [showAINotesModalFS, setShowAINotesModalFS] = useState(false);
   const [noteDraft, setNoteDraft] = useState(slide.notes);
   const [activeGuides, setActiveGuides] = useState<GuideState>(DEFAULT_GUIDES);
   const [zoomLevel, setZoomLevel] = useState(1000);
@@ -3125,50 +3628,22 @@ function ManualFullscreenEditor({ slide, slideIndex, onClose }: {
     return () => window.removeEventListener("keydown", handler);
   }, [onClose]);
 
-  const handleGenerateNotes = useCallback(async () => {
-    if (generatingNotes) return;
-    const { provider, modelId } = appStore.getEffectiveSelection();
-    const provConfig = appStore.settings.providers.find((p) => p.id === provider);
-    if (!provConfig?.hasKey || !modelId) return;
+  const handleOpenAINotesModalFS = useCallback(() => {
+    setShowAINotesModalFS(true);
+  }, []);
 
-    setGeneratingNotes(true);
-    try {
-      const slideContent = slide.elements
-        .map((el) => el.type !== "image" ? el.content : "")
-        .filter(Boolean)
-        .join("\n");
-
-      const res = await fetch("/api/generate-notes", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          provider,
-          modelId,
-          slideContent,
-          slideTitle: slide.elements.find((el) => el.type === "title")?.content || "",
-          outputLanguage: appStore.settings.outputLanguage,
-        }),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        const generatedNotes = data.notes || "";
-        setNoteDraft(generatedNotes);
-        store.updateSlideNotes(slideIndex, generatedNotes);
-      }
-    } catch (err) {
-      console.error("Failed to generate notes:", err);
-    } finally {
-      setGeneratingNotes(false);
-    }
-  }, [generatingNotes, appStore, store, slide, slideIndex]);
+  const handleAINotesSaveFS = useCallback((notes: string) => {
+    setNoteDraft(notes);
+    store.updateSlideNotes(slideIndex, notes);
+  }, [store, slideIndex]);
 
   const currentSlide = store.presentation.slides[slideIndex];
   const selectedElement = currentSlide?.elements.find((element) => element.id === store.selectedElementId);
 
   useEffect(() => {
     setNoteDraft(currentSlide?.notes || "");
-  }, [currentSlide?.id, currentSlide?.notes]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSlide?.id]);
 
   const commitNotes = useCallback(() => {
     store.updateSlideNotes(slideIndex, noteDraft);
@@ -3405,17 +3880,33 @@ function ManualFullscreenEditor({ slide, slideIndex, onClose }: {
       <div className="flex-1 flex overflow-hidden">
         {/* Left sidebar: slide list (toggleable) */}
         {showSlideListFS && (
-          <div className="w-44 border-r border-[var(--border)] bg-[var(--surface)] overflow-y-auto p-2 space-y-1.5">
+          <div className="w-44 border-r border-[var(--border)] bg-[var(--surface)] overflow-y-auto p-2 space-y-0" onMouseLeave={() => setHoverInsertIndex(null)}>
             {store.presentation.slides.map((s, i) => (
-              <button
-                key={s.id}
-                onClick={() => store.selectSlide(i)}
-                className={`w-full rounded-lg border-2 transition-all overflow-hidden ${
-                  i === slideIndex
-                    ? "border-[var(--accent)] ring-2 ring-[var(--accent)]/30"
-                    : "border-[var(--border)] hover:border-[var(--accent)]/50"
-                }`}
-              >
+              <div key={s.id}>
+                {/* Hover insert zone before this slide */}
+                <div
+                  className="relative h-2 -my-0.5 z-10 flex items-center justify-center cursor-pointer"
+                  onMouseEnter={() => setHoverInsertIndex(i)}
+                  onMouseLeave={(e) => {
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const isInside = e.clientY >= rect.top && e.clientY <= rect.bottom;
+                    if (!isInside) setHoverInsertIndex(null);
+                  }}
+                  onClick={(e) => { e.stopPropagation(); store.insertSlideAt(i, "single"); setHoverInsertIndex(null); }}
+                >
+                  <div className={`absolute inset-x-1 h-0.5 rounded-full transition-all ${hoverInsertIndex === i ? "bg-[var(--accent)] shadow-[0_0_4px_var(--accent)]" : "bg-transparent"}`} />
+                  <div className={`relative z-10 w-4 h-4 rounded-full flex items-center justify-center text-white text-[10px] font-bold transition-all ${hoverInsertIndex === i ? "bg-[var(--accent)] scale-100 opacity-100" : "scale-0 opacity-0"}`}>
+                    +
+                  </div>
+                </div>
+                <button
+                  onClick={() => store.selectSlide(i)}
+                  className={`w-full rounded-lg border-2 transition-all overflow-hidden ${
+                    i === slideIndex
+                      ? "border-[var(--accent)] ring-2 ring-[var(--accent)]/30"
+                      : "border-[var(--border)] hover:border-[var(--accent)]/50"
+                  }`}
+                >
                 <div className="aspect-[16/9] relative" style={{ backgroundColor: `#${s.bgColor}` }}>
                   {s.elements.map((el) => (
                     <div
@@ -3446,7 +3937,24 @@ function ManualFullscreenEditor({ slide, slideIndex, onClose }: {
                   <span className="absolute bottom-0.5 right-1 text-[8px] font-medium text-white/80 bg-black/40 rounded px-0.5">{i + 1}</span>
                 </div>
               </button>
+              </div>
             ))}
+            {/* Hover insert zone after all slides */}
+            <div
+              className="relative h-2 -my-0.5 z-10 flex items-center justify-center cursor-pointer"
+              onMouseEnter={() => setHoverInsertIndex(store.presentation.slides.length)}
+              onMouseLeave={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const isInside = e.clientY >= rect.top && e.clientY <= rect.bottom;
+                if (!isInside) setHoverInsertIndex(null);
+              }}
+              onClick={(e) => { e.stopPropagation(); store.insertSlideAt(store.presentation.slides.length, "single"); setHoverInsertIndex(null); }}
+            >
+              <div className={`absolute inset-x-1 h-0.5 rounded-full transition-all ${hoverInsertIndex === store.presentation.slides.length ? "bg-[var(--accent)] shadow-[0_0_4px_var(--accent)]" : "bg-transparent"}`} />
+              <div className={`relative z-10 w-4 h-4 rounded-full flex items-center justify-center text-white text-[10px] font-bold transition-all ${hoverInsertIndex === store.presentation.slides.length ? "bg-[var(--accent)] scale-100 opacity-100" : "scale-0 opacity-0"}`}>
+                +
+              </div>
+            </div>
           </div>
         )}
 
@@ -3531,11 +4039,10 @@ function ManualFullscreenEditor({ slide, slideIndex, onClose }: {
                 <p className="text-[10px] text-[var(--muted)]">{t.manualNotesHint}</p>
               </div>
               <button
-                onClick={handleGenerateNotes}
-                disabled={generatingNotes}
-                className="flex items-center gap-1 text-xs px-2 py-1 rounded-md bg-[var(--surface-2)] hover:bg-[var(--border)] disabled:opacity-50 transition-colors"
+                onClick={handleOpenAINotesModalFS}
+                className="flex items-center gap-1 text-xs px-2 py-1 rounded-md bg-[var(--surface-2)] hover:bg-[var(--border)] transition-colors"
               >
-                {generatingNotes ? <IconLoader size={10} className="animate-spin" /> : <IconSparkles size={10} />}
+                <IconSparkles size={10} />
                 AI
               </button>
             </div>
@@ -3669,8 +4176,24 @@ function ManualFullscreenEditor({ slide, slideIndex, onClose }: {
               });
             }
             store.setShowImageSearch(false);
+            prefetchImageBlob(image.url);
           }}
           onClose={() => store.setShowImageSearch(false)}
+        />
+      )}
+
+      {/* AI Notes modal (fullscreen editor) */}
+      {showAINotesModalFS && (
+        <AINotesModal
+          slideContent={slide.elements
+            .map((el) => el.type !== "image" ? el.content : "")
+            .filter(Boolean)
+            .join("\n")}
+          slideTitle={slide.elements.find((el) => el.type === "title")?.content || ""}
+          existingNotes={slide.notes || ""}
+          lang={lang}
+          onSave={handleAINotesSaveFS}
+          onClose={() => setShowAINotesModalFS(false)}
         />
       )}
 

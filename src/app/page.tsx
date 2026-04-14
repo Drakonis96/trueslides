@@ -17,6 +17,7 @@ import ManualCreator from "@/components/ManualCreator";
 import PresenterMode from "@/components/PresenterMode";
 import { useBroadcastInitReceiver } from "@/components/presenter/useBroadcastSync";
 import { IconSettings, IconCheck, IconArrowLeft, IconDownload, IconClock, IconTrash, IconPlus, IconMic, IconSearch, IconLoader, IconWarning, IconStop, IconPencilRuler } from "@/components/Icons";
+import ConfirmModal from "@/components/ConfirmModal";
 import { MousePointer2, Sparkles, Home, Presentation } from "lucide-react";
 import { SlideData, ManualElementData } from "@/lib/types";
 
@@ -28,75 +29,7 @@ interface LivePreviewSlide {
   imageUrls?: string[];
 }
 
-// ── Image pre-downloading utility ──
-
-async function downloadImageAsBase64(url: string): Promise<string | null> {
-  // If already base64, return as-is
-  if (url.startsWith("data:")) return url;
-
-  try {
-    // Use our image proxy to avoid Wikimedia 403s
-    const proxyUrl = new URL("/api/image-proxy", window.location.origin);
-    proxyUrl.searchParams.set("url", url);
-
-    const res = await fetch(proxyUrl.toString());
-    if (!res.ok) return null;
-
-    const blob = await res.blob();
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(blob);
-    });
-  } catch (err) {
-    console.warn(`[downloadImageAsBase64] Error:`, err);
-    return null;
-  }
-}
-
-async function preDownloadAllImages(
-  presentation: PresentationData
-): Promise<PresentationData> {
-  const urlsToDl = new Set<string>();
-  for (const s of presentation.slides) {
-    for (const u of s.imageUrls) {
-      if (u && !u.startsWith("data:")) urlsToDl.add(u);
-    }
-  }
-
-  if (urlsToDl.size === 0) return presentation;
-
-  const map = new Map<string, string>();
-  const urls = [...urlsToDl];
-
-  // Download in parallel (small batches to be kind to servers)
-  const batchSize = 3;
-  for (let i = 0; i < urls.length; i += batchSize) {
-    const batch = urls.slice(i, i + batchSize);
-    const results = await Promise.all(batch.map(downloadImageAsBase64));
-    batch.forEach((u, j) => {
-      if (results[j]) map.set(u, results[j]!);
-    });
-  }
-
-  // Replace URLs with base64 data
-  const result: PresentationData = {
-    ...presentation,
-    slides: presentation.slides.map((s) => ({
-      ...s,
-      imageUrls: s.imageUrls.map((u) => map.get(u) || u).filter((url) => {
-        // Only keep URLs that are either data: or successfully converted
-        return url.startsWith("data:");
-      }),
-    })),
-  };
-
-  console.log(
-    `[preDownloadAllImages] Converted ${map.size} / ${urlsToDl.size} images to base64`
-  );
-  return result;
-}
+import { prefetchImageBlobs } from "@/lib/image-blob-cache";
 
 // ── PDF download utility (captures real web slide previews) ──
 
@@ -162,24 +95,27 @@ function sanitizePreviewCloneForCanvas(
   clonedCard.style.width = `${sourceCard.offsetWidth}px`;
   clonedCard.style.height = `${sourceCard.offsetHeight}px`;
 
+  // Phase 1: batch-read all computed styles (avoids layout thrashing)
+  const computedBatch: { computed: CSSStyleDeclaration; cloneNode: HTMLElement | SVGElement }[] = [];
   for (let i = 0; i < nodeCount; i++) {
     const sourceNode = sourceNodes[i];
     const cloneNode = cloneNodes[i];
-
     if (!(sourceNode instanceof Element)) continue;
     if (!(cloneNode instanceof HTMLElement || cloneNode instanceof SVGElement)) continue;
+    computedBatch.push({ computed: getComputedStyle(sourceNode), cloneNode });
+  }
 
-    const computed = getComputedStyle(sourceNode);
-
+  // Phase 2: write resolved values to clone (only mutate, no reads)
+  for (const { computed, cloneNode } of computedBatch) {
     for (const property of colorProperties) {
-      const resolved = normalizeColorForCanvas(
-        probe,
-        property,
-        computed.getPropertyValue(property).trim(),
-      );
-      if (resolved) {
-        cloneNode.style.setProperty(property, resolved);
+      const value = computed.getPropertyValue(property).trim();
+      if (!value || !UNSUPPORTED_HTML2CANVAS_COLOR_RE.test(value)) {
+        // Already safe — skip probe round-trip
+        if (value) cloneNode.style.setProperty(property, value);
+        continue;
       }
+      const resolved = normalizeColorForCanvas(probe, property, value);
+      if (resolved) cloneNode.style.setProperty(property, resolved);
     }
 
     const backgroundImage = computed.getPropertyValue("background-image").trim();
@@ -222,7 +158,7 @@ async function renderPreviewCardToCanvas(
     await waitForPaint();
     return await html2canvas(clonedCard, {
       backgroundColor: "#ffffff",
-      scale: Math.max(3, Math.ceil((window.devicePixelRatio || 1) * 2)),
+      scale: Math.min(2, window.devicePixelRatio || 1),
       useCORS: true,
       logging: false,
     });
@@ -302,15 +238,21 @@ async function generatePDFFromWebViews(): Promise<Blob> {
       const y = (pageH - renderH) / 2;
 
       pdf.addImage(
-        canvas.toDataURL("image/png"),
-        "PNG",
+        canvas.toDataURL("image/jpeg", 0.85),
+        "JPEG",
         x,
         y,
         renderW,
         renderH,
         undefined,
-        "NONE"
+        "FAST"
       );
+
+      // Release canvas memory immediately — each can hold 10-30 MB of pixel data
+      const ctx = canvas.getContext("2d");
+      if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+      canvas.width = 0;
+      canvas.height = 0;
     }
 
     return pdf.output("blob");
@@ -381,8 +323,9 @@ export default function HomePage() {
   const [jobPartialSlides, setJobPartialSlides] = useState<Record<string, LivePreviewSlide[]>>({});
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollFailureCountsRef = useRef<Record<string, number>>({});
-  const jobNotFoundGraceMs = 10_000;
+  const jobNotFoundGraceMs = 15_000; // Grace period for job registration in dev mode
   const runningCount = useAppStore((s) => s.history.filter((e) => e.status === "running").length);
+  const [confirmModal, setConfirmModal] = useState<{ title: string; message: string; danger?: boolean; onConfirm: () => void } | null>(null);
 
   const syncJobPartialSlides = useCallback((jobId: string, slides: LivePreviewSlide[] | undefined) => {
     if (!slides) return;
@@ -450,6 +393,7 @@ export default function HomePage() {
           const res = await fetch(`/api/jobs/${entry.id}`);
           if (res.status === 404) {
             if (Date.now() - entry.createdAt < jobNotFoundGraceMs) {
+              console.debug(`[poll] Job ${entry.id}: 404 within grace window, retrying...`);
               continue;
             }
             delete pollFailureCountsRef.current[entry.id];
@@ -496,6 +440,12 @@ export default function HomePage() {
               jobLogsRef.current = { ...jobLogsRef.current, [entry.id]: job.progressLog };
             }
             syncJobPartialSlides(entry.id, job.partialSlides);
+            // Job completed — pre-download image blobs for first slides' preview
+            if (entry.type === "presentation" && job.result?.slides) {
+              const firstSlides = job.result.slides.slice(0, 10);
+              const allUrls = firstSlides.flatMap((s: { imageUrls?: string[] }) => s.imageUrls || []).filter(Boolean);
+              if (allUrls.length > 0) void prefetchImageBlobs(allUrls, 3);
+            }
             // Job completed — result is stored in history; user can load from there
           } else if (job.status === "error" || job.status === "cancelled") {
             delete pollFailureCountsRef.current[entry.id];
@@ -662,7 +612,15 @@ export default function HomePage() {
       setProgressModalJobId(historyId);
     } catch (err) {
       console.error("Generation error:", err);
-      const errorMsg = err instanceof Error ? err.message : t.apiError;
+      const langEs = settings.language === "es";
+      let errorMsg: string;
+      if (err instanceof TypeError && err.message.includes("fetch")) {
+        errorMsg = langEs ? "No se pudo conectar al servidor. Verifica tu conexión." : "Could not connect to the server. Check your connection.";
+      } else if (err instanceof Error) {
+        errorMsg = err.message;
+      } else {
+        errorMsg = t.apiError;
+      }
       setError(errorMsg);
       store.updateHistoryEntry(historyId, {
         status: "error",
@@ -674,46 +632,54 @@ export default function HomePage() {
 
   // Convert manual slides to SlideData for presenter mode
   const manualSlidesToSlideData = useCallback((): SlideData[] => {
-    return manualStore.presentation.slides.map((ms, i) => ({
-      id: ms.id,
-      index: i,
-      title: ms.elements.find((el) => el.type === "title")?.content || `Slide ${i + 1}`,
-      bullets: ms.elements.filter((el) => el.type === "bullets").flatMap((el) => el.content.split("\n").filter(Boolean)),
-      notes: ms.notes,
-      imageUrls: ms.elements.filter((el) => el.type === "image").map((el) => el.content),
-      accentColor: ms.accentColor,
-      bgColor: ms.bgColor,
-      manualElements: ms.elements.map((el): ManualElementData => ({
-        type: el.type,
-        x: el.x,
-        y: el.y,
-        w: el.w,
-        h: el.h,
-        content: el.content,
-        fontSize: el.fontSize,
-        fontWeight: el.fontWeight,
-        fontFamily: el.fontFamily,
-        textAlign: el.textAlign,
-        lineHeight: el.lineHeight,
-        color: el.color?.replace("#", ""),
-        zIndex: el.zIndex,
-        locked: el.locked,
-        imageAdjustment: el.imageAdjustment,
-        groupId: el.groupId,
-        shapeKind: el.shapeKind,
-        shapeFill: el.shapeFill,
-        shapeOpacity: el.shapeOpacity,
-        shapeBorderColor: el.shapeBorderColor,
-        shapeBorderWidth: el.shapeBorderWidth,
-        youtubeUrl: el.youtubeUrl,
-        connectorStyle: el.connectorStyle,
-        arrowStart: el.arrowStart,
-        arrowEnd: el.arrowEnd,
-        connectorColor: el.connectorColor,
-        connectorWidth: el.connectorWidth,
-        rotation: el.rotation,
-      })),
-    }));
+    return manualStore.presentation.slides.map((ms, i) => {
+      // Derive slide-level thumbnail from first image element that has one
+      const thumbEl = ms.elements.find((el) => el.type === "image" && el.thumbnailUrl);
+      return {
+        id: ms.id,
+        index: i,
+        title: ms.elements.find((el) => el.type === "title")?.content || `Slide ${i + 1}`,
+        bullets: ms.elements.filter((el) => el.type === "bullets").flatMap((el) => el.content.split("\n").filter(Boolean)),
+        notes: ms.notes,
+        // Skip data: URIs here — they're already in manualElements.content.
+        // SlideRenderer for manual slides uses manualElements, never imageUrls.
+        imageUrls: ms.elements.filter((el) => el.type === "image" && !el.content.startsWith("data:")).map((el) => el.content),
+        accentColor: ms.accentColor,
+        bgColor: ms.bgColor,
+        thumbnailUrl: thumbEl?.thumbnailUrl,
+        manualElements: ms.elements.map((el): ManualElementData => ({
+          type: el.type,
+          x: el.x,
+          y: el.y,
+          w: el.w,
+          h: el.h,
+          content: el.content,
+          fontSize: el.fontSize,
+          fontWeight: el.fontWeight,
+          fontFamily: el.fontFamily,
+          textAlign: el.textAlign,
+          lineHeight: el.lineHeight,
+          color: el.color?.replace("#", ""),
+          zIndex: el.zIndex,
+          locked: el.locked,
+          imageAdjustment: el.imageAdjustment,
+          groupId: el.groupId,
+          shapeKind: el.shapeKind,
+          shapeFill: el.shapeFill,
+          shapeOpacity: el.shapeOpacity,
+          shapeBorderColor: el.shapeBorderColor,
+          shapeBorderWidth: el.shapeBorderWidth,
+          youtubeUrl: el.youtubeUrl,
+          connectorStyle: el.connectorStyle,
+          arrowStart: el.arrowStart,
+          arrowEnd: el.arrowEnd,
+          connectorColor: el.connectorColor,
+          connectorWidth: el.connectorWidth,
+          rotation: el.rotation,
+          thumbnailUrl: el.thumbnailUrl,
+        })),
+      };
+    });
   }, [manualStore.presentation.slides]);
 
   const handleDownload = useCallback(
@@ -758,29 +724,19 @@ export default function HomePage() {
           return;
         }
 
-        // PPTX download with images
+        // PPTX download — send original URLs, server downloads images
         setStatus("building-pptx");
         const langEs = settings.language === "es";
         setProgress(
           15,
-          langEs ? "Descargando imágenes..." : "Downloading images..."
-        );
-
-        // Pre-download all images as base64 to avoid server-side Wikimedia 403s
-        const presentationWithImages = await preDownloadAllImages(
-          presentation
-        );
-
-        setProgress(
-          40,
-          langEs ? "Construyendo PPTX..." : "Building PPTX..."
+          langEs ? "Construyendo PPTX (el servidor descarga las imágenes)..." : "Building PPTX (server downloading images)..."
         );
 
         const res = await fetch("/api/build-pptx", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            presentation: presentationWithImages,
+            presentation,
             imageLayout,
             slideLayout,
             stretchImages,
@@ -799,10 +755,13 @@ export default function HomePage() {
 
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
-          setError(data.error || "Failed to build PPTX");
+          setError(data.error || (langEs ? "Error al construir el PPTX" : "Failed to build PPTX"));
           setStatus("done");
           return;
         }
+
+        // Check for server-side image download failures
+        const serverImagesFailed = res.headers.get("X-Images-Failed");
 
         setProgress(95, langEs ? "Finalizando..." : "Finalizing...");
         const blob = await res.blob();
@@ -812,16 +771,33 @@ export default function HomePage() {
         a.download = `${presentation.title || "presentation"}.pptx`;
         a.click();
         URL.revokeObjectURL(url);
-        setStatus("done");
+
+        if (serverImagesFailed) {
+          const msg = langEs
+            ? `${serverImagesFailed} imágenes no se descargaron en el servidor`
+            : `${serverImagesFailed} images failed to download on server`;
+          setProgress(100, msg);
+          setTimeout(() => setStatus("done"), 4000);
+        } else {
+          setStatus("done");
+        }
       } catch (err) {
         console.error("Download error:", err);
-        setError(
-          format === "pdf"
-            ? "Failed to generate PDF"
-            : format === "notes"
-              ? "Failed to download notes"
-              : "Failed to build PPTX file"
-        );
+        const langEs = settings.language === "es";
+        let errorMsg: string;
+        if (err instanceof TypeError && err.message.includes("fetch")) {
+          errorMsg = langEs ? "No se pudo conectar al servidor." : "Could not connect to the server.";
+        } else if (format === "pdf") {
+          errorMsg = langEs ? "Error al generar el PDF." : "Failed to generate PDF.";
+        } else if (format === "notes") {
+          errorMsg = langEs ? "Error al descargar las notas." : "Failed to download notes.";
+        } else {
+          errorMsg = langEs ? "Error al construir el archivo PPTX." : "Failed to build PPTX file.";
+        }
+        if (err instanceof Error && err.message && !err.message.includes("fetch")) {
+          errorMsg += ` (${err.message})`;
+        }
+        setError(errorMsg);
         setStatus("done");
       }
     },
@@ -839,30 +815,46 @@ export default function HomePage() {
       store.setStatus("done");
       store.setActiveTab("creator");
       store.setCreatorSubTab("edit");
+      // Pre-download first slides' image blobs in background for preview
+      const firstSlides = entry.presentation.slides.slice(0, 10);
+      const allUrls = firstSlides.flatMap((s) => s.imageUrls).filter(Boolean);
+      if (allUrls.length > 0) void prefetchImageBlobs(allUrls, 3);
     }
   }, [store]);
 
   const deleteFromHistory = useCallback((id: string) => {
-    if (confirm(t.historyDeleteConfirm)) {
-      store.deleteFromHistory(id);
-    }
-  }, [store, t]);
+    setConfirmModal({
+      title: lang === "es" ? "Eliminar" : "Delete",
+      message: t.historyDeleteConfirm,
+      danger: true,
+      onConfirm: () => {
+        store.deleteFromHistory(id);
+        setConfirmModal(null);
+      },
+    });
+  }, [store, t, lang]);
 
   const stopJob = useCallback(async (id: string) => {
-    if (!confirm(t.historyStopConfirm)) return;
-    try {
-      const res = await fetch(`/api/jobs/${id}`, { method: "DELETE" });
-      if (res.ok) {
-        store.updateHistoryEntry(id, {
-          status: "error",
-          errorMessage: lang === "es" ? "Cancelado por el usuario" : "Cancelled by user",
-          completedAt: Date.now(),
-        });
-        // Job cancelled — tracked in history
-      }
-    } catch {
-      // ignore
-    }
+    setConfirmModal({
+      title: lang === "es" ? "Detener" : "Stop",
+      message: t.historyStopConfirm,
+      danger: true,
+      onConfirm: async () => {
+        setConfirmModal(null);
+        try {
+          const res = await fetch(`/api/jobs/${id}`, { method: "DELETE" });
+          if (res.ok) {
+            store.updateHistoryEntry(id, {
+              status: "error",
+              errorMessage: lang === "es" ? "Cancelado por el usuario" : "Cancelled by user",
+              completedAt: Date.now(),
+            });
+          }
+        } catch {
+          // ignore
+        }
+      },
+    });
   }, [store, t, lang]);
 
   const handleDownloadFromHistory = useCallback(
@@ -882,16 +874,13 @@ export default function HomePage() {
       try {
         setStatus("building-pptx");
         const langEs = settings.language === "es";
-        setProgress(15, langEs ? "Descargando imágenes..." : "Downloading images...");
-
-        const presentationWithImages = await preDownloadAllImages(entry.presentation);
-        setProgress(40, langEs ? "Construyendo PPTX..." : "Building PPTX...");
+        setProgress(15, langEs ? "Construyendo PPTX (el servidor descarga las imágenes)..." : "Building PPTX (server downloading images)...");
 
         const res = await fetch("/api/build-pptx", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            presentation: presentationWithImages,
+            presentation: entry.presentation,
             imageLayout,
             slideLayout,
             stretchImages,
@@ -915,6 +904,7 @@ export default function HomePage() {
           return;
         }
 
+        const serverImagesFailed = res.headers.get("X-Images-Failed");
         setProgress(95, langEs ? "Finalizando..." : "Finalizing...");
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
@@ -923,7 +913,16 @@ export default function HomePage() {
         a.download = `${entry.title || "presentation"}.pptx`;
         a.click();
         URL.revokeObjectURL(url);
-        setStatus("done");
+
+        if (serverImagesFailed) {
+          const msg = langEs
+            ? `${serverImagesFailed} imágenes no se descargaron en el servidor`
+            : `${serverImagesFailed} images failed to download on server`;
+          setProgress(100, msg);
+          setTimeout(() => setStatus("done"), 4000);
+        } else {
+          setStatus("done");
+        }
       } catch (err) {
         console.error("Download error:", err);
         setError("Failed to build PPTX file");
@@ -1082,10 +1081,18 @@ export default function HomePage() {
     const isManualTab = store.activeTab === "manual";
     const slides = isManualTab ? manualSlidesToSlideData() : (store.presentation?.slides || []);
     const title = isManualTab ? manualStore.presentation.title : (store.presentation?.title || "Presentation");
+    const handleUpdateNotes = (slideIndex: number, notes: string) => {
+      if (isManualTab) {
+        manualStore.updateSlideNotes(slideIndex, notes);
+      } else {
+        store.updateSlide(slideIndex, { notes });
+      }
+    };
     return (
       <PresenterMode
         slides={slides}
         presentationTitle={title}
+        onUpdateNotes={handleUpdateNotes}
         onExit={() => setPresenterMode(false)}
       />
     );
@@ -1400,7 +1407,7 @@ export default function HomePage() {
                 </section>
 
                 {/* Status */}
-                <StatusBar />
+                <StatusBar onRetry={handleGenerate} />
 
                 {/* Generate button */}
                 <div className="flex gap-3">
@@ -1418,7 +1425,7 @@ export default function HomePage() {
                 {/* Edit sub-tab — Post-generation view */}
                 {store.presentation ? (
                   <>
-                    <StatusBar />
+                    <StatusBar onRetry={() => handleDownload("pptx")} />
 
                     {/* Action buttons */}
                     <div className="flex gap-3">
@@ -1543,23 +1550,20 @@ export default function HomePage() {
 
               const renderRow = (entry: HistoryEntry) => (
                 <tr key={entry.id} className="border-b border-[var(--border)] last:border-b-0 hover:bg-[var(--surface-2)]/50 transition-colors">
-                  <td className="px-4 py-3 text-sm">
-                    <div className="max-w-[220px] truncate font-medium" title={entry.title}>
+                  <td className="px-3 py-2.5 text-sm">
+                    <div className="max-w-[140px] truncate font-medium" title={entry.title}>
                       {entry.title}
                     </div>
+                    <span className="text-[10px] text-[var(--muted)]">
+                      {entry.type === "presentation" ? t.historyTypePresentation : t.historyTypeNotes}
+                      {entry.slideCount != null ? ` · ${entry.slideCount} slides` : ""}
+                    </span>
                   </td>
-                  <td className="px-4 py-3 text-xs text-[var(--muted)]">
-                    {entry.type === "presentation" ? t.historyTypePresentation : t.historyTypeNotes}
-                  </td>
-                  <td className="px-4 py-3">{statusBadge(entry)}</td>
-                  <td className="px-4 py-3 text-xs text-[var(--muted)] capitalize">{entry.provider || "—"}</td>
-                  <td className="px-4 py-3 text-xs text-[var(--muted)] text-center">
-                    {entry.slideCount != null ? entry.slideCount : "—"}
-                  </td>
-                  <td className="px-4 py-3 text-xs text-[var(--muted)] whitespace-nowrap">
+                  <td className="px-3 py-2.5">{statusBadge(entry)}</td>
+                  <td className="px-3 py-2.5 text-xs text-[var(--muted)] whitespace-nowrap">
                     {new Date(entry.createdAt).toLocaleDateString(locale, dateOpts)}
                   </td>
-                  <td className="px-4 py-3">
+                  <td className="px-3 py-2.5">
                     <div className="flex items-center gap-1">
                       {entry.status === "completed" && (
                         <>
@@ -1637,16 +1641,19 @@ export default function HomePage() {
                             {t.historyInProgress} ({running.length})
                           </h3>
                           <div className="bg-[var(--surface-2)] border border-blue-500/20 rounded-xl overflow-hidden">
-                            <table className="w-full text-left">
+                            <table className="w-full table-fixed text-left">
+                              <colgroup>
+                                <col className="w-[35%]" />
+                                <col className="w-[25%]" />
+                                <col className="w-[22%]" />
+                                <col className="w-[18%]" />
+                              </colgroup>
                               <thead>
                                 <tr className="border-b border-[var(--border)] text-xs text-[var(--muted)] uppercase tracking-wider">
-                                  <th className="px-4 py-2.5 font-medium">{t.historyColTitle}</th>
-                                  <th className="px-4 py-2.5 font-medium">{t.historyColType}</th>
-                                  <th className="px-4 py-2.5 font-medium">{t.historyColStatus}</th>
-                                  <th className="px-4 py-2.5 font-medium">{t.historyColProvider}</th>
-                                  <th className="px-4 py-2.5 font-medium text-center">{t.historyColSlides}</th>
-                                  <th className="px-4 py-2.5 font-medium">{t.historyColDate}</th>
-                                  <th className="px-4 py-2.5 font-medium">{t.historyColActions}</th>
+                                  <th className="px-3 py-2 font-medium">{t.historyColTitle}</th>
+                                  <th className="px-3 py-2 font-medium">{t.historyColStatus}</th>
+                                  <th className="px-3 py-2 font-medium">{t.historyColDate}</th>
+                                  <th className="px-3 py-2 font-medium">{t.historyColActions}</th>
                                 </tr>
                               </thead>
                               <tbody>
@@ -1667,16 +1674,19 @@ export default function HomePage() {
                             </h3>
                           )}
                           <div className="bg-[var(--surface-2)] border border-[var(--border)] rounded-xl overflow-hidden">
-                            <table className="w-full text-left">
+                            <table className="w-full table-fixed text-left">
+                              <colgroup>
+                                <col className="w-[35%]" />
+                                <col className="w-[25%]" />
+                                <col className="w-[22%]" />
+                                <col className="w-[18%]" />
+                              </colgroup>
                               <thead>
                                 <tr className="border-b border-[var(--border)] text-xs text-[var(--muted)] uppercase tracking-wider">
-                                  <th className="px-4 py-2.5 font-medium">{t.historyColTitle}</th>
-                                  <th className="px-4 py-2.5 font-medium">{t.historyColType}</th>
-                                  <th className="px-4 py-2.5 font-medium">{t.historyColStatus}</th>
-                                  <th className="px-4 py-2.5 font-medium">{t.historyColProvider}</th>
-                                  <th className="px-4 py-2.5 font-medium text-center">{t.historyColSlides}</th>
-                                  <th className="px-4 py-2.5 font-medium">{t.historyColDate}</th>
-                                  <th className="px-4 py-2.5 font-medium">{t.historyColActions}</th>
+                                  <th className="px-3 py-2 font-medium">{t.historyColTitle}</th>
+                                  <th className="px-3 py-2 font-medium">{t.historyColStatus}</th>
+                                  <th className="px-3 py-2 font-medium">{t.historyColDate}</th>
+                                  <th className="px-3 py-2 font-medium">{t.historyColActions}</th>
                                 </tr>
                               </thead>
                               <tbody>
@@ -1735,6 +1745,17 @@ export default function HomePage() {
           />
         );
       })()}
+
+      <ConfirmModal
+        open={!!confirmModal}
+        title={confirmModal?.title ?? ""}
+        message={confirmModal?.message ?? ""}
+        danger={confirmModal?.danger}
+        confirmLabel={lang === "es" ? "Confirmar" : "Confirm"}
+        cancelLabel={lang === "es" ? "Cancelar" : "Cancel"}
+        onConfirm={() => confirmModal?.onConfirm()}
+        onCancel={() => setConfirmModal(null)}
+      />
     </div>
   );
 }

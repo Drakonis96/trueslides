@@ -296,7 +296,7 @@ export default function PromptPanel() {
                 />
               </div>
               <div className="flex gap-1 mt-1">
-                {["FFFFFF", "F8FAFC", "0F172A", "1E293B", "050B16"].map((c) => (
+                {["000000", "0F172A", "1E293B", "F8FAFC", "FFFFFF"].map((c) => (
                   <button
                     key={c}
                     onClick={() => setSlideBgColor(c)}

@@ -28,6 +28,12 @@ jest.mock("@/lib/key-store", () => ({
   getImageSourceKey: jest.fn().mockReturnValue(null),
 }));
 
+jest.mock("@/lib/rate-limit", () => ({
+  rateLimiters: {
+    ai: { check: jest.fn().mockReturnValue({ allowed: true }) },
+  },
+}));
+
 jest.mock("@/lib/job-manager", () => ({
   createJob: (...args: unknown[]) => createJob(...args),
   getJob: (...args: unknown[]) => getJob(...args),
@@ -41,7 +47,7 @@ jest.mock("@/lib/generate-slides", () => ({
   generateSlides: (...args: unknown[]) => generateSlides(...args),
 }));
 
-jest.mock("@/app/api/images/route", () => ({
+jest.mock("@/lib/image-search", () => ({
   searchSlideImages: (...args: unknown[]) => searchSlideImages(...args),
 }));
 

@@ -16,6 +16,24 @@ export function sanitizeErrorMessage(raw: string): string {
   return safe;
 }
 
+/**
+ * Recursively sanitize all string values in an error object.
+ * Handles nested objects and arrays. Returns a new sanitized object.
+ */
+export function sanitizeErrorData(data: unknown, depth: number = 0): unknown {
+  if (depth > 10) return "[TRUNCATED]";
+  if (typeof data === "string") return sanitizeErrorMessage(data);
+  if (Array.isArray(data)) return data.map((item) => sanitizeErrorData(item, depth + 1));
+  if (data && typeof data === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(data)) {
+      result[key] = sanitizeErrorData(value, depth + 1);
+    }
+    return result;
+  }
+  return data;
+}
+
 interface CallAIOptions {
   stream?: boolean;
   onTextChunk?: (chunk: string) => void;
@@ -116,7 +134,7 @@ export async function callAI(
       });
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(sanitizeErrorMessage(`OpenRouter error ${res.status}: ${JSON.stringify(errData)}`));
+        throw new Error(`OpenRouter error ${res.status}: ${JSON.stringify(sanitizeErrorData(errData))}`);
       }
       if (options?.stream) {
         return readSSEContent(
@@ -158,7 +176,7 @@ export async function callAI(
       );
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(sanitizeErrorMessage(`Gemini error ${res.status}: ${JSON.stringify(errData)}`));
+        throw new Error(`Gemini error ${res.status}: ${JSON.stringify(sanitizeErrorData(errData))}`);
       }
       if (isStream) {
         return readSSEContent(
@@ -206,7 +224,7 @@ export async function callAI(
       });
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(sanitizeErrorMessage(`Claude error ${res.status}: ${JSON.stringify(errData)}`));
+        throw new Error(`Claude error ${res.status}: ${JSON.stringify(sanitizeErrorData(errData))}`);
       }
       if (isStream) {
         return readSSEContent(
@@ -248,7 +266,7 @@ export async function callAI(
       });
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(sanitizeErrorMessage(`OpenAI error ${res.status}: ${JSON.stringify(errData)}`));
+        throw new Error(`OpenAI error ${res.status}: ${JSON.stringify(sanitizeErrorData(errData))}`);
       }
       if (options?.stream) {
         return readSSEContent(
@@ -324,7 +342,7 @@ export async function callAIVision(
       });
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(sanitizeErrorMessage(`OpenRouter vision error ${res.status}: ${JSON.stringify(errData)}`));
+        throw new Error(`OpenRouter vision error ${res.status}: ${JSON.stringify(sanitizeErrorData(errData))}`);
       }
       const data = await res.json();
       return data.choices?.[0]?.message?.content || "";
@@ -361,7 +379,7 @@ export async function callAIVision(
       );
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(sanitizeErrorMessage(`Gemini vision error ${res.status}: ${JSON.stringify(errData)}`));
+        throw new Error(`Gemini vision error ${res.status}: ${JSON.stringify(sanitizeErrorData(errData))}`);
       }
       const data = await res.json();
       return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
@@ -405,7 +423,7 @@ export async function callAIVision(
       });
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(sanitizeErrorMessage(`Claude vision error ${res.status}: ${JSON.stringify(errData)}`));
+        throw new Error(`Claude vision error ${res.status}: ${JSON.stringify(sanitizeErrorData(errData))}`);
       }
       const data = await res.json();
       return data.content?.[0]?.text || "";
@@ -441,7 +459,7 @@ export async function callAIVision(
       });
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(sanitizeErrorMessage(`OpenAI vision error ${res.status}: ${JSON.stringify(errData)}`));
+        throw new Error(`OpenAI vision error ${res.status}: ${JSON.stringify(sanitizeErrorData(errData))}`);
       }
       const data = await res.json();
       return data.choices?.[0]?.message?.content || "";

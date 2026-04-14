@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getSessionId } from "@/lib/session";
-import { getJob, getJobInfo, getSessionJobs, cancelJob } from "@/lib/job-manager";
+import { getAllJobs, getJob, getJobInfo, cancelJob } from "@/lib/job-manager";
 
 /**
  * GET /api/jobs/[id]
@@ -10,14 +9,13 @@ export async function GET(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const sessionId = await getSessionId();
   const { id } = await params;
 
   if (id === "all") {
-    return NextResponse.json({ jobs: getSessionJobs(sessionId) });
+    return NextResponse.json({ jobs: getAllJobs() });
   }
 
-  const job = getJob(id, sessionId);
+  const job = getJob(id);
   if (!job) {
     return NextResponse.json({ error: "Job not found" }, { status: 404 });
   }
@@ -33,10 +31,9 @@ export async function DELETE(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const sessionId = await getSessionId();
   const { id } = await params;
 
-  const cancelled = cancelJob(id, sessionId);
+  const cancelled = cancelJob(id);
   if (!cancelled) {
     return NextResponse.json(
       { error: "Job not found or not running" },

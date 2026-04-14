@@ -51,6 +51,7 @@ export default function PresenterAIChat({
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const mouseDownTarget = useRef<EventTarget | null>(null);
 
   // Load models when provider changes
   useEffect(() => {
@@ -106,13 +107,75 @@ export default function PresenterAIChat({
         }),
       });
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Request failed");
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || "Request failed");
+      }
 
-      setMessages((prev) => [...prev, { role: "assistant", content: data.response }]);
+      // Stream SSE response
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error("No response body");
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let assistantContent = "";
+      // Add empty assistant message that will be updated incrementally
+      setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line.startsWith("data:")) continue;
+          const payloadStr = line.slice(5).trim();
+          if (!payloadStr || payloadStr === "[DONE]") continue;
+
+          try {
+            const payload = JSON.parse(payloadStr) as { type: string; content?: string };
+            if (payload.type === "chunk" && payload.content) {
+              assistantContent += payload.content;
+              setMessages((prev) => {
+                const updated = [...prev];
+                updated[updated.length - 1] = { role: "assistant", content: assistantContent };
+                return updated;
+              });
+            } else if (payload.type === "replace" && payload.content) {
+              // Full replacement (e.g. JSON was reformatted)
+              assistantContent = payload.content;
+              setMessages((prev) => {
+                const updated = [...prev];
+                updated[updated.length - 1] = { role: "assistant", content: assistantContent };
+                return updated;
+              });
+            } else if (payload.type === "error" && payload.content) {
+              setMessages((prev) => {
+                const updated = [...prev];
+                updated[updated.length - 1] = { role: "assistant", content: `Error: ${payload.content}` };
+                return updated;
+              });
+            }
+          } catch {
+            // Ignore malformed SSE lines
+          }
+        }
+      }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : "Unknown error";
-      setMessages((prev) => [...prev, { role: "assistant", content: `Error: ${errMsg}` }]);
+      setMessages((prev) => {
+        // If last message is an empty assistant stub, replace it; otherwise append
+        if (prev.length > 0 && prev[prev.length - 1].role === "assistant" && !prev[prev.length - 1].content) {
+          const updated = [...prev];
+          updated[updated.length - 1] = { role: "assistant", content: `Error: ${errMsg}` };
+          return updated;
+        }
+        return [...prev, { role: "assistant", content: `Error: ${errMsg}` }];
+      });
     } finally {
       setLoading(false);
     }
@@ -145,13 +208,16 @@ export default function PresenterAIChat({
   return (
     <div
       className="fixed inset-0 z-[9999] flex items-center justify-center"
-      onClick={onClose}
+      onMouseDown={(e) => { mouseDownTarget.current = e.target; }}
+      onClick={(e) => {
+        // Only close if click started AND ended on the backdrop itself (not during text selection drag)
+        if (e.target === e.currentTarget && mouseDownTarget.current === e.currentTarget) onClose();
+      }}
       style={{ backgroundColor: "rgba(0,0,0,0.6)", backdropFilter: "blur(4px)" }}
     >
       <div
-        className="bg-[var(--bg)] border border-[var(--border)] rounded-2xl shadow-2xl flex flex-col"
+        className="bg-[var(--bg)] border border-[var(--border)] rounded-2xl shadow-2xl flex flex-col select-text"
         style={{ width: "min(600px, 90vw)", height: "min(700px, 85vh)" }}
-        onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-3 border-b border-[var(--border)]">
@@ -229,7 +295,7 @@ export default function PresenterAIChat({
         </div>
 
         {/* Messages */}
-        <div className="flex-1 overflow-y-auto px-5 py-3 space-y-3" style={{ minHeight: 0 }}>
+        <div className="flex-1 overflow-y-auto px-5 py-3 space-y-3 select-text cursor-text" style={{ minHeight: 0 }}>
           {providersWithKeys.length === 0 && (
             <div className="flex items-center justify-center h-full">
               <p className="text-sm text-[var(--muted)]">{t.noKey}</p>

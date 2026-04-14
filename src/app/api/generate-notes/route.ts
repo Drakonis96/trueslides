@@ -298,7 +298,7 @@ export async function POST(req: NextRequest) {
     const body: GenerateNotesRequest = await req.json();
 
     const sessionId = await getSessionId();
-    const apiKey = getApiKey(sessionId, body.provider);
+    const apiKey = getApiKey(body.provider);
 
     if (!apiKey) {
       return NextResponse.json(
@@ -321,7 +321,7 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      createJob(body.jobId, sessionId, "notes");
+      createJob(body.jobId, "notes");
       runNotesJob(body.jobId, body, apiKey);
       return NextResponse.json({ jobId: body.jobId });
     }

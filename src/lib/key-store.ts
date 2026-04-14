@@ -57,9 +57,7 @@ function decrypt(encoded: string): string {
 // ── Storage ──
 
 interface KeyStore {
-  [sessionId: string]: {
-    [provider: string]: string; // encrypted API key
-  };
+  [provider: string]: string; // encrypted API key
 }
 
 const DATA_DIR = join(process.cwd(), "data");
@@ -76,7 +74,25 @@ function readStore(): KeyStore {
   if (!existsSync(STORE_PATH)) return {};
   try {
     const raw = readFileSync(STORE_PATH, "utf8");
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    // Migrate from old session-keyed format: if top-level values are objects
+    // (not strings), merge all sessions into a flat store.
+    if (parsed && typeof parsed === "object") {
+      const keys = Object.keys(parsed);
+      if (keys.length > 0 && typeof parsed[keys[0]] === "object" && parsed[keys[0]] !== null) {
+        const merged: KeyStore = {};
+        for (const sessionData of Object.values(parsed) as Record<string, string>[]) {
+          for (const [provider, encryptedKey] of Object.entries(sessionData)) {
+            if (typeof encryptedKey === "string" && !merged[provider]) {
+              merged[provider] = encryptedKey;
+            }
+          }
+        }
+        writeStore(merged);
+        return merged;
+      }
+    }
+    return parsed as KeyStore;
   } catch {
     return {};
   }
@@ -92,22 +108,21 @@ function writeStore(store: KeyStore): void {
 // ── Public API ──
 
 /**
- * Store an encrypted API key for a provider in a given session.
+ * Store an encrypted API key for a provider.
  */
-export function setApiKey(sessionId: string, provider: AIProvider, apiKey: string): void {
+export function setApiKey(provider: AIProvider, apiKey: string): void {
   const store = readStore();
-  if (!store[sessionId]) store[sessionId] = {};
-  store[sessionId][provider] = encrypt(apiKey);
+  store[provider] = encrypt(apiKey);
   writeStore(store);
 }
 
 /**
- * Retrieve the decrypted API key for a provider in a given session.
+ * Retrieve the decrypted API key for a provider.
  * Returns null if not found.
  */
-export function getApiKey(sessionId: string, provider: AIProvider): string | null {
+export function getApiKey(provider: AIProvider): string | null {
   const store = readStore();
-  const encrypted = store[sessionId]?.[provider];
+  const encrypted = store[provider];
   if (!encrypted) return null;
   try {
     return decrypt(encrypted);
@@ -117,46 +132,39 @@ export function getApiKey(sessionId: string, provider: AIProvider): string | nul
 }
 
 /**
- * Delete an API key for a provider in a given session.
+ * Delete an API key for a provider.
  */
-export function deleteApiKey(sessionId: string, provider: AIProvider): void {
+export function deleteApiKey(provider: AIProvider): void {
   const store = readStore();
-  if (store[sessionId]) {
-    delete store[sessionId][provider];
-    if (Object.keys(store[sessionId]).length === 0) {
-      delete store[sessionId];
-    }
-  }
+  delete store[provider];
   writeStore(store);
 }
 
 /**
- * Get a summary of which providers have keys set for a session.
+ * Get a summary of which providers have keys set.
  * NEVER returns the actual key values.
  */
-export function getKeyStatus(sessionId: string): Record<AIProvider, boolean> {
+export function getKeyStatus(): Record<AIProvider, boolean> {
   const store = readStore();
-  const session = store[sessionId] || {};
   return {
-    openrouter: !!session.openrouter,
-    gemini: !!session.gemini,
-    claude: !!session.claude,
-    openai: !!session.openai,
+    openrouter: !!store.openrouter,
+    gemini: !!store.gemini,
+    claude: !!store.claude,
+    openai: !!store.openai,
   };
 }
 
 // ── Image Source Keys ──
 
-export function setImageSourceKey(sessionId: string, sourceId: ImageSourceId, apiKey: string): void {
+export function setImageSourceKey(sourceId: ImageSourceId, apiKey: string): void {
   const store = readStore();
-  if (!store[sessionId]) store[sessionId] = {};
-  store[sessionId][IMG_PREFIX + sourceId] = encrypt(apiKey);
+  store[IMG_PREFIX + sourceId] = encrypt(apiKey);
   writeStore(store);
 }
 
-export function getImageSourceKey(sessionId: string, sourceId: ImageSourceId): string | null {
+export function getImageSourceKey(sourceId: ImageSourceId): string | null {
   const store = readStore();
-  const encrypted = store[sessionId]?.[IMG_PREFIX + sourceId];
+  const encrypted = store[IMG_PREFIX + sourceId];
   if (!encrypted) return null;
   try {
     return decrypt(encrypted);
@@ -165,30 +173,24 @@ export function getImageSourceKey(sessionId: string, sourceId: ImageSourceId): s
   }
 }
 
-export function deleteImageSourceKey(sessionId: string, sourceId: ImageSourceId): void {
+export function deleteImageSourceKey(sourceId: ImageSourceId): void {
   const store = readStore();
-  if (store[sessionId]) {
-    delete store[sessionId][IMG_PREFIX + sourceId];
-    if (Object.keys(store[sessionId]).length === 0) {
-      delete store[sessionId];
-    }
-  }
+  delete store[IMG_PREFIX + sourceId];
   writeStore(store);
 }
 
-export function getImageSourceKeyStatus(sessionId: string): Record<ImageSourceId, boolean> {
+export function getImageSourceKeyStatus(): Record<ImageSourceId, boolean> {
   const store = readStore();
-  const session = store[sessionId] || {};
   return {
     wikimedia: true, // always available
     openverse: true, // always available (no key needed)
     loc: true,       // always available (no key needed)
-    unsplash: !!session[IMG_PREFIX + "unsplash"],
-    pexels: !!session[IMG_PREFIX + "pexels"],
-    pixabay: !!session[IMG_PREFIX + "pixabay"],
-    flickr: !!session[IMG_PREFIX + "flickr"],
-    europeana: !!session[IMG_PREFIX + "europeana"],
-    hispana: !!session[IMG_PREFIX + "hispana"],
+    unsplash: !!store[IMG_PREFIX + "unsplash"],
+    pexels: !!store[IMG_PREFIX + "pexels"],
+    pixabay: !!store[IMG_PREFIX + "pixabay"],
+    flickr: !!store[IMG_PREFIX + "flickr"],
+    europeana: !!store[IMG_PREFIX + "europeana"],
+    hispana: !!store[IMG_PREFIX + "hispana"],
   };
 }
 
@@ -197,28 +199,22 @@ export function getImageSourceKeyStatus(sessionId: string): Record<ImageSourceId
 const AI_PROVIDERS: AIProvider[] = ["openrouter", "gemini", "claude", "openai"];
 const KEYED_IMAGE_SOURCES: ImageSourceId[] = ["unsplash", "pexels", "pixabay", "flickr", "europeana", "hispana"];
 
-export function deleteAllAiKeys(sessionId: string): void {
+export function deleteAllAiKeys(): void {
   const store = readStore();
-  if (!store[sessionId]) return;
   for (const p of AI_PROVIDERS) {
-    delete store[sessionId][p];
+    delete store[p];
   }
-  if (Object.keys(store[sessionId]).length === 0) delete store[sessionId];
   writeStore(store);
 }
 
-export function deleteAllImageSourceKeys(sessionId: string): void {
+export function deleteAllImageSourceKeys(): void {
   const store = readStore();
-  if (!store[sessionId]) return;
   for (const s of KEYED_IMAGE_SOURCES) {
-    delete store[sessionId][IMG_PREFIX + s];
+    delete store[IMG_PREFIX + s];
   }
-  if (Object.keys(store[sessionId]).length === 0) delete store[sessionId];
   writeStore(store);
 }
 
-export function deleteAllKeys(sessionId: string): void {
-  const store = readStore();
-  delete store[sessionId];
-  writeStore(store);
+export function deleteAllKeys(): void {
+  writeStore({});
 }

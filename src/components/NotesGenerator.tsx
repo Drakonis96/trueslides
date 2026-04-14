@@ -81,7 +81,7 @@ export default function NotesGenerator() {
   const store = useAppStore();
   const lang = store.settings.language;
   const t = UI_TEXT[lang];
-  const jobNotFoundGraceMs = 10_000;
+  const jobNotFoundGraceMs = 15_000; // Grace period for job registration in dev mode
 
   const { provider: effectiveProvider, modelId: effectiveModelId } =
     store.getEffectiveSelection();

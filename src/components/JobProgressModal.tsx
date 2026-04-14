@@ -86,6 +86,16 @@ export default function JobProgressModal({
   const isRunning = status === "running";
   const isError = status === "error";
 
+  // Timeout warning: AI has a 15-minute timeout
+  const AI_TIMEOUT_MS = 15 * 60 * 1000;
+  const TIMEOUT_WARN_MS = 13 * 60 * 1000; // warn at 13 min
+  const elapsedMs = currentTime - baseTime;
+  const isNearTimeout = isRunning && elapsedMs >= TIMEOUT_WARN_MS;
+  const isTimedOut = isError && progressLog.some((e) => e.message.includes("timed out") || e.message.includes("timeout") || e.message.includes("aborted"));
+  const timeoutRemainingSeconds = Math.max(0, Math.ceil((AI_TIMEOUT_MS - elapsedMs) / 1000));
+  const timeoutRemainingMin = Math.floor(timeoutRemainingSeconds / 60);
+  const timeoutRemainingSec = timeoutRemainingSeconds % 60;
+
   const statusIcon = isRunning ? (
     <IconLoader size={18} className="animate-spin text-blue-400" />
   ) : isError ? (
@@ -252,6 +262,26 @@ export default function JobProgressModal({
               </div>
             </div>
 
+            {/* Timeout warning banner */}
+            {(isNearTimeout || isTimedOut) && (
+              <div className={`mx-6 mb-2 flex items-start gap-2 rounded-lg px-3 py-2 text-xs ${
+                isTimedOut
+                  ? "bg-red-500/10 border border-red-500/20 text-red-400"
+                  : "bg-amber-500/10 border border-amber-500/20 text-amber-400"
+              }`}>
+                <IconWarning size={14} className="mt-0.5 shrink-0" />
+                <span>
+                  {isTimedOut
+                    ? (lang === "es"
+                      ? "La generación excedió el límite de 15 minutos y fue cancelada automáticamente. Intenta con menos diapositivas o un modelo más rápido."
+                      : "Generation exceeded the 15-minute limit and was automatically cancelled. Try fewer slides or a faster model.")
+                    : (lang === "es"
+                      ? `Atención: la generación se detendrá automáticamente en ${timeoutRemainingMin}m ${timeoutRemainingSec}s (límite de 15 minutos).`
+                      : `Warning: generation will automatically stop in ${timeoutRemainingMin}m ${timeoutRemainingSec}s (15-minute limit).`)}
+                </span>
+              </div>
+            )}
+
             <div className="px-6 pt-2 pb-1 flex items-center justify-between">
               <h3 className="text-[10px] font-semibold text-[var(--muted)] uppercase tracking-wider">
                 {lang === "es" ? "Registro de actividad" : "Activity Log"}
@@ -267,6 +297,7 @@ export default function JobProgressModal({
                 {progressLog.map((entry, i) => {
                   const isLast = i === progressLog.length - 1;
                   const isErrorEntry = entry.message.startsWith("Error:");
+                  const isWarningEntry = entry.message.startsWith("Warning:");
                   const isDone = entry.message === "Done";
 
                   return (
@@ -276,6 +307,8 @@ export default function JobProgressModal({
                         className={`absolute -left-[calc(0.25rem+5px)] top-[11px] w-2 h-2 rounded-full border-2 ${
                           isErrorEntry
                             ? "bg-red-500 border-red-500"
+                            : isWarningEntry
+                            ? "bg-amber-500 border-amber-500"
                             : isDone
                             ? "bg-emerald-500 border-emerald-500"
                             : isLast && isRunning
@@ -294,6 +327,8 @@ export default function JobProgressModal({
                           className={`text-xs leading-snug ${
                             isErrorEntry
                               ? "text-red-400"
+                              : isWarningEntry
+                              ? "text-amber-400"
                               : isDone
                               ? "text-emerald-400 font-medium"
                               : isLast && isRunning

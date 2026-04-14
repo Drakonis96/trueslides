@@ -17,6 +17,9 @@ RUN npm run build
 FROM base AS runner
 WORKDIR /app
 
+# LibreOffice + poppler for PPTX-to-images conversion, plus fonts
+RUN apk add --no-cache libreoffice-impress poppler-utils ttf-dejavu font-noto
+
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOSTNAME=0.0.0.0

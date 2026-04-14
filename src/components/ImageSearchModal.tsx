@@ -5,6 +5,7 @@ import { useAppStore } from "@/lib/store";
 import { UI_TEXT } from "@/lib/presets";
 import { ImageSourceId, SlideLayoutId, SLIDE_LAYOUTS } from "@/lib/types";
 import { IconSearch, IconLoader, IconImage, IconGlobe, IconInfo } from "./Icons";
+import { fetchImagesWithCache } from "@/lib/image-cache-idb";
 
 interface ImageResult {
   title: string;
@@ -75,6 +76,8 @@ export default function ImageSearchModal({
   const [showSlotPicker, setShowSlotPicker] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const lastSearchedQuery = useRef("");
+  const searchingRef = useRef(false);
+  const searchGenRef = useRef(0);
   const [translateToEnglish, setTranslateToEnglish] = useState(false);
   const [translating, setTranslating] = useState(false);
   const [infoImage, setInfoImage] = useState<ImageResult | null>(null);
@@ -133,13 +136,18 @@ export default function ImageSearchModal({
   const doSearch = useCallback(async (append: boolean, overrideSource?: ImageSourceId | "all") => {
     const trimmed = query.trim();
     if (!trimmed) return;
-    if (append ? loadingMore : searching) return;
+    // For "load more", block if already loading more
+    if (append && loadingMore) return;
 
     const activeSource = overrideSource ?? sourceFilter;
+
+    // Bump generation so any in-flight non-append search becomes stale
+    const gen = append ? searchGenRef.current : ++searchGenRef.current;
 
     if (append) {
       setLoadingMore(true);
     } else {
+      searchingRef.current = true;
       setSearching(true);
       setHasSearched(true);
       setResults([]);
@@ -149,6 +157,10 @@ export default function ImageSearchModal({
 
     try {
       const searchText = await translateQuery(trimmed);
+
+      // If a newer search was started while we were translating, abort
+      if (gen !== searchGenRef.current) return;
+
       const sourcesToSearch =
         activeSource === "all"
           ? enabledSources
@@ -161,10 +173,7 @@ export default function ImageSearchModal({
         ? results.flatMap((r) => [r.url, r.thumbUrl])
         : [];
 
-      const res = await fetch("/api/images", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const data = await fetchImagesWithCache({
           searchTerms: [[searchText]],
           presentationTopic: presentationTopic || "",
           slideContexts: [{ title: searchText, bullets: [], section: "" }],
@@ -177,12 +186,13 @@ export default function ImageSearchModal({
             reduceQueryCandidates: true,
             lowerFetchLimit: true,
           },
-        }),
-      });
+        });
 
-      const data = await res.json();
-      if (res.ok && data.images?.[0]) {
-        const newImages: ImageResult[] = data.images[0];
+      // If a newer search was started while we were fetching, discard results
+      if (gen !== searchGenRef.current) return;
+
+      if (data.ok && data.images?.[0]) {
+        const newImages = data.images[0] as ImageResult[];
         if (append) {
           setResults((prev) => [...prev, ...newImages]);
           // Keep "Load More" visible as long as new results were returned;
@@ -198,13 +208,17 @@ export default function ImageSearchModal({
         setHasMore(false);
       }
     } catch {
+      if (gen !== searchGenRef.current) return;
       if (!append) setResults([]);
       setHasMore(false);
     } finally {
-      setSearching(false);
+      if (gen === searchGenRef.current) {
+        searchingRef.current = false;
+        setSearching(false);
+      }
       setLoadingMore(false);
     }
-  }, [query, sourceFilter, enabledSources, presentationTopic, searching, loadingMore, results, translateQuery]);
+  }, [query, sourceFilter, enabledSources, presentationTopic, loadingMore, results, translateQuery]);
 
   const handleSearch = useCallback(() => doSearch(false), [doSearch]);
   const handleLoadMore = useCallback(() => doSearch(true), [doSearch]);
@@ -328,10 +342,7 @@ export default function ImageSearchModal({
           ? [src]
           : [src];
 
-      fetch("/api/images", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      fetchImagesWithCache({
           searchTerms: [[searchText]],
           presentationTopic: presentationTopic || "",
           slideContexts: [{ title: searchText, bullets: [], section: "" }],
@@ -344,12 +355,10 @@ export default function ImageSearchModal({
             reduceQueryCandidates: true,
             lowerFetchLimit: true,
           },
-        }),
-      })
-        .then((res) => res.json())
+        })
         .then((data) => {
-          if (data.images?.[0]) {
-            const newImages: ImageResult[] = data.images[0];
+          if (data.ok && data.images?.[0]) {
+            const newImages = data.images[0] as ImageResult[];
             setResults(newImages);
             setHasMore(newImages.length >= PAGE_SIZE);
           } else {

@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { AIProvider } from "@/lib/types";
 import { getApiKey } from "@/lib/key-store";
-import { getSessionId } from "@/lib/session";
 import { sanitizeErrorMessage } from "@/lib/ai-client";
 
 interface ModelsRequest {
@@ -13,8 +12,7 @@ export async function POST(req: NextRequest) {
     const body: ModelsRequest = await req.json();
     const { provider } = body;
 
-    const sessionId = await getSessionId();
-    const apiKey = getApiKey(sessionId, provider);
+    const apiKey = getApiKey(provider);
 
     if (!apiKey) {
       return NextResponse.json(

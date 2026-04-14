@@ -35,6 +35,7 @@ export interface ManualSlideElement {
   connectorColor?: string; // hex without #
   connectorWidth?: number; // px
   rotation?: number; // degrees, 0-360
+  thumbnailUrl?: string; // low-res preview for filmstrip (PPTX imports)
 }
 
 export interface ManualSlide {
@@ -228,8 +229,9 @@ interface ManualStoreState {
   deleteCreation: (creationId: string) => void;
   saveActiveCreation: () => void;
   setTitle: (title: string) => void;
-  addSlide: (layout: ManualLayoutId) => void;
-  addSlideFromTemplate: (templateId: PredefinedTemplateId) => void;
+  addSlide: (layout: ManualLayoutId, count?: number) => void;
+  insertSlideAt: (index: number, layout: ManualLayoutId) => void;
+  addSlideFromTemplate: (templateId: PredefinedTemplateId, count?: number) => void;
   duplicateSlide: (index: number) => void;
   deleteSlide: (index: number) => void;
   deleteSlides: (indices: number[]) => void;
@@ -267,13 +269,23 @@ interface ManualStoreState {
   reset: () => void;
 }
 
-const MAX_UNDO = 50;
+const MAX_UNDO = 20;
 const MANUAL_CREATIONS_API = "/api/manual-creations";
 const LEGACY_STORAGE_KEY = "trueslides.manual.creations.v1";
 const SAVE_DEBOUNCE_MS = 800;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
+/**
+ * Clone slides using structuredClone (modern API) for efficiency.
+ * Falls back to JSON.parse/stringify for older browsers.
+ * structuredClone is ~50x faster and avoids creating large intermediate strings.
+ */
 function cloneSlides(slides: ManualSlide[]): ManualSlide[] {
+  // Check if structuredClone is available (modern browsers)
+  if (typeof globalThis !== "undefined" && typeof (globalThis as any).structuredClone === "function") {
+    return (globalThis as any).structuredClone(slides);
+  }
+  // Fallback for older environments
   return JSON.parse(JSON.stringify(slides));
 }
 
@@ -282,7 +294,17 @@ const initialPresentation: ManualPresentation = {
   slides: [],
 };
 
+/**
+ * Clone presentation using structuredClone (modern API) for efficiency.
+ * Falls back to JSON.parse/stringify for older browsers.
+ * Avoids allocating giant intermediate JSON strings during deep copies.
+ */
 function clonePresentation(presentation: ManualPresentation): ManualPresentation {
+  // Check if structuredClone is available (modern browsers)
+  if (typeof globalThis !== "undefined" && typeof (globalThis as any).structuredClone === "function") {
+    return (globalThis as any).structuredClone(presentation);
+  }
+  // Fallback for older environments
   return JSON.parse(JSON.stringify(presentation));
 }
 
@@ -589,12 +611,12 @@ export const useManualStore = create<ManualStoreState>()((set, get) => ({
       };
     }),
 
-  addSlide: (layout) => {
+  addSlide: (layout, count = 1) => {
     const state = get();
     if (!state.activeCreationId) return;
     const accent = state.presentation.slides[0]?.accentColor || "6366F1";
-    const newSlide = createSlideFromLayout(layout, accent);
-    const slides = [...state.presentation.slides, newSlide];
+    const newSlides = Array.from({ length: Math.max(1, count) }, () => createSlideFromLayout(layout, accent));
+    const slides = [...state.presentation.slides, ...newSlides];
     const presentation = { ...state.presentation, slides };
     const creations = syncActiveCreation(state.creations, state.activeCreationId, presentation);
     persistCreations(creations, state.activeCreationId, true);
@@ -609,12 +631,33 @@ export const useManualStore = create<ManualStoreState>()((set, get) => ({
     });
   },
 
-  addSlideFromTemplate: (templateId) => {
+  insertSlideAt: (index, layout) => {
     const state = get();
     if (!state.activeCreationId) return;
     const accent = state.presentation.slides[0]?.accentColor || "6366F1";
-    const newSlide = createSlideFromTemplate(templateId, accent);
-    const slides = [...state.presentation.slides, newSlide];
+    const newSlide = createSlideFromLayout(layout, accent);
+    const slides = [...state.presentation.slides];
+    slides.splice(index, 0, newSlide);
+    const presentation = { ...state.presentation, slides };
+    const creations = syncActiveCreation(state.creations, state.activeCreationId, presentation);
+    persistCreations(creations, state.activeCreationId, true);
+    set({
+      undoStack: [...state.undoStack.slice(-MAX_UNDO + 1), { slides: cloneSlides(state.presentation.slides), selectedSlideIndex: state.selectedSlideIndex }],
+      redoStack: [],
+      presentation,
+      creations,
+      selectedSlideIndex: index,
+      selectedElementId: null,
+      lastSavedAt: Date.now(),
+    });
+  },
+
+  addSlideFromTemplate: (templateId, count = 1) => {
+    const state = get();
+    if (!state.activeCreationId) return;
+    const accent = state.presentation.slides[0]?.accentColor || "6366F1";
+    const newSlides = Array.from({ length: Math.max(1, count) }, () => createSlideFromTemplate(templateId, accent));
+    const slides = [...state.presentation.slides, ...newSlides];
     const presentation = { ...state.presentation, slides };
     const creations = syncActiveCreation(state.creations, state.activeCreationId, presentation);
     persistCreations(creations, state.activeCreationId, true);

@@ -4,6 +4,22 @@ import React from "react";
 import { SlideData, SLIDE_LAYOUTS, ManualElementData } from "@/lib/types";
 import { getImageAdjustmentStyle } from "@/lib/image-adjustments";
 
+/* ── Image proxy helper ── */
+
+/**
+ * Route an image URL through /api/image-proxy with an optional width hint.
+ * For Wikimedia originals the proxy rewrites to their CDN thumbnail endpoint,
+ * drastically reducing decoded-pixel memory in the browser.
+ */
+function proxyUrl(src: string, width?: number): string {
+  if (!src) return src;
+  // Skip data URIs, blob URLs, and local API URLs (already served optimally)
+  if (src.startsWith("data:") || src.startsWith("blob:") || src.startsWith("/api/")) return src;
+  const params = new URLSearchParams({ url: src });
+  if (width && width > 0) params.set("w", String(Math.round(width)));
+  return `/api/image-proxy?${params.toString()}`;
+}
+
 /* ── YouTube helpers ── */
 
 function extractYouTubeId(url: string): string | null {
@@ -17,15 +33,26 @@ function extractYouTubeId(url: string): string | null {
 
 function YouTubeEmbed({ url, className, style }: { url: string; className?: string; style?: React.CSSProperties }) {
   const videoId = extractYouTubeId(url);
+  const iframeRef = React.useRef<HTMLIFrameElement>(null);
   if (!videoId) return null;
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const src = `https://www.youtube-nocookie.com/embed/${encodeURIComponent(videoId)}?rel=0&enablejsapi=1${origin ? `&origin=${encodeURIComponent(origin)}` : ""}`;
   return (
     <div className={className} style={style}>
       <iframe
-        src={`https://www.youtube-nocookie.com/embed/${encodeURIComponent(videoId)}?rel=0&enablejsapi=1`}
+        ref={iframeRef}
+        src={src}
         allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
         allowFullScreen
         className="w-full h-full border-0 rounded"
         title="YouTube video"
+        onLoad={() => {
+          // Initiate YouTube JS API postMessage handshake so play/pause commands work
+          iframeRef.current?.contentWindow?.postMessage(
+            JSON.stringify({ event: "listening", id: videoId }),
+            "*"
+          );
+        }}
       />
     </div>
   );
@@ -70,10 +97,11 @@ function ManualElement({ el, containerW, containerH }: { el: ManualElementData; 
 
   if (el.type === "image" && el.content) {
     const imgStyle = el.imageAdjustment ? getImageAdjustmentStyle(el.imageAdjustment) : {};
+    const elW = (el.w / 100) * containerW;
     return (
       <div style={base}>
         {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={el.content} alt="" className="w-full h-full" style={{ objectFit: "cover", ...imgStyle }} />
+        <img src={proxyUrl(el.content, Math.round(elW * 2))} alt="" loading="lazy" decoding="async" className="w-full h-full" style={{ objectFit: "cover", ...imgStyle }} />
       </div>
     );
   }
@@ -129,7 +157,7 @@ interface SlideRendererProps {
   globalLayout?: string;
 }
 
-export default function SlideRenderer({
+const SlideRenderer = React.memo(function SlideRenderer({
   slide,
   width,
   height,
@@ -188,7 +216,7 @@ export default function SlideRenderer({
               return (
                 <div style={{ width: "100%", height: "100%", position: "relative" }}>
                   {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={slide.imageUrls[0]} alt="" style={{ width: "100%", height: "100%", ...getImgStyle(0) }} />
+                  <img src={proxyUrl(slide.imageUrls[0], width * 2)} alt="" decoding="async" style={{ width: "100%", height: "100%", ...getImgStyle(0) }} />
                   <div style={{ position: "absolute", inset: 0, background: "linear-gradient(transparent 50%, rgba(0,0,0,0.4))" }} />
                 </div>
               );
@@ -201,7 +229,7 @@ export default function SlideRenderer({
                   <div key={i} style={{ position: "absolute", left: `${slot.x * 100}%`, top: `${slot.y * 100}%`, width: `${slot.w * 100}%`, height: `${slot.h * 100}%`, borderRadius: 6, overflow: "hidden" }}>
                     {url ? (
                       /* eslint-disable-next-line @next/next/no-img-element */
-                      <img src={url} alt="" style={{ width: "100%", height: "100%", ...getImgStyle(i) }} />
+                      <img src={proxyUrl(url, Math.round(slot.w * width * 2))} alt="" loading="lazy" decoding="async" style={{ width: "100%", height: "100%", ...getImgStyle(i) }} />
                     ) : (
                       <div style={{ width: "100%", height: "100%", background: "#0001" }} />
                     )}
@@ -263,7 +291,7 @@ export default function SlideRenderer({
                   <div key={i} style={{ borderRadius: 6, overflow: "hidden", minHeight: 0 }}>
                     {url ? (
                       /* eslint-disable-next-line @next/next/no-img-element */
-                      <img src={url} alt="" style={{ width: "100%", height: "100%", ...getImgStyle(i) }} />
+                      <img src={proxyUrl(url, Math.round(width * 0.33 * 2))} alt="" loading="lazy" decoding="async" style={{ width: "100%", height: "100%", ...getImgStyle(i) }} />
                     ) : (
                       <div style={{ width: "100%", height: "100%", background: "#0001" }} />
                     )}
@@ -279,4 +307,6 @@ export default function SlideRenderer({
       <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: 2, backgroundColor: accent, zIndex: 20 }} />
     </div>
   );
-}
+});
+
+export default SlideRenderer;

@@ -17,26 +17,38 @@ export function getMaxImageOffset(_scale?: number): number {
   return 50;
 }
 
+export const OBJECT_FIT_OPTIONS = ["cover", "contain", "fill", "none"] as const;
+
 export function clampImageAdjustment(adjustment?: Partial<ImageAdjustment> | null): ImageAdjustment {
   const scale = Math.max(1, Number(adjustment?.scale) || 1);
   const maxOffset = getMaxImageOffset(scale);
+  const objectFit = adjustment?.objectFit && (OBJECT_FIT_OPTIONS as readonly string[]).includes(adjustment.objectFit)
+    ? adjustment.objectFit as ImageAdjustment["objectFit"]
+    : undefined;
 
   return {
     scale,
     offsetX: clamp(Number(adjustment?.offsetX) || 0, -maxOffset, maxOffset),
     offsetY: clamp(Number(adjustment?.offsetY) || 0, -maxOffset, maxOffset),
     opacity: clamp(Number(adjustment?.opacity) || 100, 0, 100),
+    objectFit,
   };
 }
 
 export function getImageAdjustmentStyle(adjustment?: Partial<ImageAdjustment> | null): CSSProperties {
   const adj = clampImageAdjustment(adjustment);
+  const fit = adj.objectFit || "cover";
 
   const style: CSSProperties = {
-    objectFit: "cover",
+    objectFit: fit,
     objectPosition: `${50 - adj.offsetX}% ${50 - adj.offsetY}%`,
     opacity: (adj.opacity ?? 100) / 100,
   };
+
+  // For contain/none, add a subtle checkered bg so letterboxing is visible
+  if (fit === "contain" || fit === "none") {
+    style.backgroundColor = "rgba(0,0,0,0.04)";
+  }
 
   if (adj.scale > 1) {
     style.transform = `scale(${adj.scale})`;

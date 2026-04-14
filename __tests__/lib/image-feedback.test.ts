@@ -2,12 +2,12 @@
  * @jest-environment node
  */
 
-let store: Record<string, Record<string, unknown>> = {};
+let store: Record<string, unknown> | null = null;
 
 jest.mock("@/lib/state-store", () => ({
-  getUserState: jest.fn((sessionId: string) => store[sessionId] ?? null),
-  setUserState: jest.fn((sessionId: string, state: Record<string, unknown>) => {
-    store[sessionId] = state;
+  getUserState: jest.fn(() => store),
+  setUserState: jest.fn((state: Record<string, unknown>) => {
+    store = state;
   }),
 }));
 
@@ -15,11 +15,11 @@ import { getImageFeedbackProfile, recordImageFeedback } from "@/lib/image-feedba
 
 describe("image feedback store", () => {
   beforeEach(() => {
-    store = {};
+    store = null;
   });
 
   it("persists selected and rejected signals and retrieves them by topic", () => {
-    recordImageFeedback("session-1", {
+    recordImageFeedback({
       action: "selected",
       imageUrl: "https://example.com/good.jpg",
       imageTitle: "Daguerreotype camera",
@@ -33,7 +33,7 @@ describe("image feedback store", () => {
       queryTerms: ["daguerreotype", "antique camera"],
     });
 
-    recordImageFeedback("session-1", {
+    recordImageFeedback({
       action: "rejected",
       imageUrl: "https://example.com/bad.jpg",
       imageTitle: "Generic factory building",
@@ -46,7 +46,7 @@ describe("image feedback store", () => {
       queryTerms: ["camera history"],
     });
 
-    const profile = getImageFeedbackProfile("session-1", "History of photography", {
+    const profile = getImageFeedbackProfile("History of photography", {
       title: "Early cameras",
       section: "Origins",
     });

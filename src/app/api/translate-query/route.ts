@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { AIProvider } from "@/lib/types";
 import { getApiKey } from "@/lib/key-store";
-import { getSessionId } from "@/lib/session";
 import { callAI } from "@/lib/ai-client";
 
 interface TranslateRequest {
@@ -14,8 +13,7 @@ export async function POST(req: NextRequest) {
   try {
     const body: TranslateRequest = await req.json();
 
-    const sessionId = await getSessionId();
-    const apiKey = getApiKey(sessionId, body.provider);
+    const apiKey = getApiKey(body.provider);
 
     if (!apiKey || !body.text?.trim()) {
       return NextResponse.json(

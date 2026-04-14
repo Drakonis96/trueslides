@@ -44,8 +44,8 @@ function normalizeTopicKey(presentationTopic?: string, slideContext?: Partial<Sl
   return [topic, context].filter(Boolean).join(" :: ").toLowerCase();
 }
 
-function readFeedbackState(sessionId: string): StoredImageFeedback {
-  const state = getUserState(sessionId) ?? {};
+function readFeedbackState(): StoredImageFeedback {
+  const state = getUserState() ?? {};
   const raw = state.imageFeedback as StoredImageFeedback | undefined;
   if (!raw || raw.version !== 1) {
     return {
@@ -62,9 +62,9 @@ function readFeedbackState(sessionId: string): StoredImageFeedback {
   };
 }
 
-function writeFeedbackState(sessionId: string, feedback: StoredImageFeedback): void {
-  const state = getUserState(sessionId) ?? {};
-  setUserState(sessionId, { ...state, imageFeedback: feedback });
+function writeFeedbackState(feedback: StoredImageFeedback): void {
+  const state = getUserState() ?? {};
+  setUserState({ ...state, imageFeedback: feedback });
 }
 
 function mergeProfiles(...profiles: Array<SearchFeedbackProfile | undefined>): SearchFeedbackProfile {
@@ -124,19 +124,18 @@ function applyEvent(profile: SearchFeedbackProfile, event: ImageFeedbackEvent): 
 }
 
 export function getImageFeedbackProfile(
-  sessionId: string,
   presentationTopic?: string,
   slideContext?: Partial<SlideContextLike>,
 ): SearchFeedbackProfile {
-  const feedback = readFeedbackState(sessionId);
+  const feedback = readFeedbackState();
   const topicKey = normalizeTopicKey(presentationTopic, slideContext);
   const topicProfile = topicKey ? feedback.topics[topicKey] : undefined;
   if (topicProfile) return mergeProfiles(topicProfile);
   return mergeProfiles(feedback.global);
 }
 
-export function recordImageFeedback(sessionId: string, event: ImageFeedbackEvent): void {
-  const feedback = readFeedbackState(sessionId);
+export function recordImageFeedback(event: ImageFeedbackEvent): void {
+  const feedback = readFeedbackState();
   applyEvent(feedback.global, event);
 
   const topicKey = normalizeTopicKey(event.presentationTopic, event.slideContext);
@@ -145,12 +144,12 @@ export function recordImageFeedback(sessionId: string, event: ImageFeedbackEvent
     applyEvent(feedback.topics[topicKey], event);
   }
 
-  writeFeedbackState(sessionId, feedback);
+  writeFeedbackState(feedback);
 }
 
-export function __resetImageFeedbackForTests(sessionId: string): void {
-  const state = getUserState(sessionId) ?? {};
+export function __resetImageFeedbackForTests(): void {
+  const state = getUserState() ?? {};
   const { imageFeedback, ...rest } = state;
   void imageFeedback;
-  setUserState(sessionId, rest);
+  setUserState(rest);
 }

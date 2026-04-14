@@ -52,5 +52,6 @@ export {
   Save           as IconSave,
   Info           as IconInfo,
   PencilRuler    as IconPencilRuler,
+  ImageOff       as IconImageOff,
 } from "lucide-react";
 

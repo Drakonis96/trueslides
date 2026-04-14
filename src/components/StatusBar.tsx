@@ -12,7 +12,42 @@ const STEP_LABELS: Record<string, { en: string; es: string }> = {
   "building-pptx": { en: "Building PPTX file", es: "Construyendo archivo PPTX" },
 };
 
-export default function StatusBar() {
+type ErrorCategory = "network" | "input" | "rate-limit" | "api";
+
+function classifyError(error: string): ErrorCategory {
+  const lower = error.toLowerCase();
+  if (lower.includes("fetch") || lower.includes("network") || lower.includes("unavailable") || lower.includes("econnrefused") || lower.includes("timeout") || lower.includes("server restarted") || lower.includes("servidor")) {
+    return "network";
+  }
+  if (lower.includes("empty") || lower.includes("upload") || lower.includes("paste") || lower.includes("sube") || lower.includes("pega") || lower.includes("unsupported file")) {
+    return "input";
+  }
+  if (lower.includes("rate limit") || lower.includes("too many requests") || lower.includes("429") || lower.includes("wait")) {
+    return "rate-limit";
+  }
+  return "api";
+}
+
+const ERROR_HINTS: Record<ErrorCategory, { en: string; es: string }> = {
+  network: {
+    en: "Could not reach the server. Check your connection and try again.",
+    es: "No se pudo conectar al servidor. Verifica tu conexión e intenta de nuevo.",
+  },
+  input: {
+    en: "Please check your input and try again.",
+    es: "Revisa tu entrada e intenta de nuevo.",
+  },
+  "rate-limit": {
+    en: "Too many requests. Please wait a moment before retrying.",
+    es: "Demasiadas solicitudes. Espera un momento antes de reintentar.",
+  },
+  api: {
+    en: "The AI API returned an error. Check your API key and model settings.",
+    es: "La API de IA devolvió un error. Verifica tu clave API y configuración del modelo.",
+  },
+};
+
+export default function StatusBar({ onRetry }: { onRetry?: () => void }) {
   const { status, statusMessage, progress, error, settings } = useAppStore();
   const lang = settings.language;
   const t = UI_TEXT[lang];
@@ -20,13 +55,26 @@ export default function StatusBar() {
   if (status === "idle" || status === "done") return null;
 
   if (status === "error") {
+    const category = classifyError(error);
+    const hint = ERROR_HINTS[category][lang];
+    const canRetry = category !== "input";
+
     return (
       <div className="bg-[var(--danger)]/10 border border-[var(--danger)]/30 rounded-xl p-4 flex items-center gap-3">
         <span className="text-[var(--danger)]"><IconWarning size={18} /></span>
-        <div className="flex-1">
+        <div className="flex-1 min-w-0">
           <p className="text-sm font-medium text-[var(--danger)]">{t.error}</p>
-          <p className="text-xs text-[var(--muted)]">{error}</p>
+          <p className="text-xs text-[var(--muted)] mt-0.5">{error}</p>
+          {hint !== error && <p className="text-xs text-[var(--muted)] mt-1 opacity-70">{hint}</p>}
         </div>
+        {canRetry && onRetry && (
+          <button
+            onClick={onRetry}
+            className="shrink-0 px-3 py-1.5 text-xs font-medium rounded-lg bg-[var(--danger)]/15 text-[var(--danger)] hover:bg-[var(--danger)]/25 transition-colors"
+          >
+            {t.retry}
+          </button>
+        )}
       </div>
     );
   }

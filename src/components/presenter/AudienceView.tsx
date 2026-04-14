@@ -5,7 +5,7 @@ import { SlideData } from "@/lib/types";
 import { useAppStore } from "@/lib/store";
 import { useBroadcastReceiver, useBroadcastSender } from "./useBroadcastSync";
 import SlideRenderer from "./SlideRenderer";
-import { OverlayRenderer, InteractiveOverlay, PresenterToolbar, DEFAULT_OVERLAY, clearOverlayDrawings } from "./PresenterToolsOverlay";
+import { OverlayRenderer, InteractiveOverlay, PresenterToolbar, MagnifierRenderer, DEFAULT_OVERLAY, clearOverlayDrawings } from "./PresenterToolsOverlay";
 import type { OverlayState } from "./PresenterToolsOverlay";
 import { Maximize, Minimize } from "lucide-react";
 
@@ -89,8 +89,8 @@ export default function AudienceView({
       iframes.forEach((iframe) => {
         try {
           const msg = action === "play"
-            ? '{"event":"command","func":"playVideo","args":""}'
-            : '{"event":"command","func":"pauseVideo","args":""}';
+            ? '{"event":"command","func":"playVideo","args":[]}'
+            : '{"event":"command","func":"pauseVideo","args":[]}';
           iframe.contentWindow?.postMessage(msg, "*");
         } catch { /* cross-origin guard */ }
       });
@@ -197,6 +197,8 @@ export default function AudienceView({
             overlaySectionColor={overlaySectionColor}
           />
         </div>
+        {/* Block direct interaction with YouTube iframes while allowing postMessage control */}
+        <div style={{ position: "absolute", inset: 0, zIndex: 1 }} />
         <div style={{ position: "absolute", inset: 0, zIndex: 2 }}>
           {localTool ? (
             <InteractiveOverlay
@@ -213,6 +215,23 @@ export default function AudienceView({
             />
           )}
         </div>
+        {overlayState.tool === "magnifier" && overlayState.cursorActive && (
+          <MagnifierRenderer state={overlayState} width={dims.w} height={dims.h}>
+            <SlideRenderer
+              slide={slide}
+              width={dims.w}
+              height={dims.h}
+              bgColor={bgColor}
+              headingFont={headingFont}
+              bodyFont={bodyFont}
+              textDensity={textDensity}
+              layoutMode={layoutMode}
+              globalLayout={globalLayout}
+              overlayTitleColor={overlayTitleColor}
+              overlaySectionColor={overlaySectionColor}
+            />
+          </MagnifierRenderer>
+        )}
       </div>
 
       {/* Floating toolbar — appears on mouse-near-bottom */}

@@ -31,7 +31,7 @@ export interface PresenterSession {
   presentationTitle: string;
   overlayState?: OverlayState;
   /** Tools enabled on remote */
-  remoteTools: Array<"flashlight" | "draw" | "pointer">;
+  remoteTools: Array<"flashlight" | "draw" | "pointer" | "magnifier">;
 }
 
 export type SessionCommand =
@@ -39,8 +39,8 @@ export type SessionCommand =
   | { type: "slide-next" }
   | { type: "slide-prev" }
   | { type: "overlay-update"; overlay: OverlayState }
-  | { type: "tool-toggle"; tool: "flashlight" | "draw" | "pointer"; enabled: boolean }
-  | { type: "tools-reorder"; tools: Array<"flashlight" | "draw" | "pointer"> }
+  | { type: "tool-toggle"; tool: "flashlight" | "draw" | "pointer" | "magnifier"; enabled: boolean }
+  | { type: "tools-reorder"; tools: Array<"flashlight" | "draw" | "pointer" | "magnifier"> }
   | { type: "video-control"; action: "play" | "pause" };
 
 export type SessionEvent =
@@ -107,10 +107,11 @@ export function createSession(
       section: s.section || "",
       notes: s.notes || "",
       hasVideo: (s.bullets || []).some((b) => /https?:\/\/(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)/.test(b))
+        || (s.imageUrls || []).some((u) => /https?:\/\/(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)/.test(u))
         || (s.manualElements || []).some((el) => el.type === "youtube" && el.youtubeUrl),
     })),
     presentationTitle,
-    remoteTools: ["flashlight", "draw", "pointer"],
+    remoteTools: ["flashlight", "draw", "pointer", "magnifier"],
   };
   sessions.set(id, session);
   // Store full slides + style separately (not broadcast via SSE)

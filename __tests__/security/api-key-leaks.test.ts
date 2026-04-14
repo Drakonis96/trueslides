@@ -7,7 +7,7 @@
  * response bodies, headers, URLs, or any other channel.
  */
 
-import { sanitizeErrorMessage } from "@/lib/ai-client";
+import { sanitizeErrorMessage, sanitizeErrorData } from "@/lib/ai-client";
 
 // ── sanitizeErrorMessage unit tests ──
 
@@ -238,7 +238,7 @@ describe("Source code — error responses never contain raw API keys", () => {
   const root = join(__dirname, "..", "..");
   const routeFiles = collectFiles(join(root, "src", "app", "api"), [".ts"]);
 
-  it("all ai-client error throws use sanitizeErrorMessage", () => {
+  it("all ai-client error throws use sanitizeErrorMessage or sanitizeErrorData", () => {
     const aiClientPath = join(root, "src", "lib", "ai-client.ts");
     const content = readFileSync(aiClientPath, "utf8");
 
@@ -248,7 +248,8 @@ describe("Source code — error responses never contain raw API keys", () => {
     );
 
     for (const line of throwLines) {
-      expect(line).toContain("sanitizeErrorMessage");
+      const hasSanitize = line.includes("sanitizeErrorMessage") || line.includes("sanitizeErrorData");
+      expect(hasSanitize).toBe(true);
     }
   });
 
@@ -368,5 +369,215 @@ describe("Docker Compose — secrets passed via environment only", () => {
   it("does not mount source code or .env into container", () => {
     expect(compose).not.toMatch(/\.env:/);
     expect(compose).not.toMatch(/\.\/src:/);
+  });
+});
+
+// ── sanitizeErrorData recursive tests ──
+
+describe("sanitizeErrorData — recursive object sanitization", () => {
+  it("sanitizes strings at top level", () => {
+    const result = sanitizeErrorData("Bearer sk-or-v1-abc123xyz456def789");
+    expect(result).toBe("Bearer [REDACTED]");
+  });
+
+  it("sanitizes nested object values", () => {
+    const result = sanitizeErrorData({
+      message: "Auth failed",
+      details: {
+        key: "sk-proj-abc123456789012345678901234567890",
+        nested: { url: "https://api.example.com?key=AIzaSySecret1234567890abcdef" },
+      },
+    }) as Record<string, unknown>;
+    const raw = JSON.stringify(result);
+    expect(raw).not.toContain("sk-proj-abc");
+    expect(raw).not.toContain("AIzaSySecret");
+    expect(raw).toContain("[REDACTED]");
+  });
+
+  it("sanitizes arrays", () => {
+    const result = sanitizeErrorData([
+      "Bearer sk-test-abcdefghijklmnopqrst12345",
+      { key: "AIzaSyTestKey12345678901234" },
+    ]);
+    const raw = JSON.stringify(result);
+    expect(raw).not.toContain("sk-test-abc");
+    expect(raw).not.toContain("AIzaSyTestKey");
+  });
+
+  it("handles non-string primitives safely", () => {
+    expect(sanitizeErrorData(42)).toBe(42);
+    expect(sanitizeErrorData(null)).toBe(null);
+    expect(sanitizeErrorData(true)).toBe(true);
+    expect(sanitizeErrorData(undefined)).toBe(undefined);
+  });
+
+  it("limits recursion depth", () => {
+    // Build deeply nested object
+    let obj: Record<string, unknown> = { key: "sk-deep-abcdefghijklmnopqrst12345" };
+    for (let i = 0; i < 15; i++) {
+      obj = { nested: obj };
+    }
+    const result = JSON.stringify(sanitizeErrorData(obj));
+    // Should not throw and should truncate deep nesting
+    expect(result).toContain("[TRUNCATED]");
+  });
+});
+
+// ── Rate limiter unit tests ──
+
+import { RateLimiter } from "@/lib/rate-limit";
+
+describe("RateLimiter", () => {
+  it("allows requests under the limit", () => {
+    const limiter = new RateLimiter({ maxRequests: 3, windowMs: 60_000 });
+    expect(limiter.check("session-1").allowed).toBe(true);
+    expect(limiter.check("session-1").allowed).toBe(true);
+    expect(limiter.check("session-1").allowed).toBe(true);
+  });
+
+  it("blocks requests over the limit", () => {
+    const limiter = new RateLimiter({ maxRequests: 2, windowMs: 60_000 });
+    limiter.check("session-1");
+    limiter.check("session-1");
+    const result = limiter.check("session-1");
+    expect(result.allowed).toBe(false);
+    expect(result.retryAfterMs).toBeGreaterThan(0);
+  });
+
+  it("tracks separate keys independently", () => {
+    const limiter = new RateLimiter({ maxRequests: 1, windowMs: 60_000 });
+    expect(limiter.check("session-a").allowed).toBe(true);
+    expect(limiter.check("session-b").allowed).toBe(true);
+    expect(limiter.check("session-a").allowed).toBe(false);
+  });
+
+  it("cleans up stale entries", () => {
+    const limiter = new RateLimiter({ maxRequests: 1, windowMs: 1 });
+    limiter.check("session-cleanup");
+    // After cleanup with tiny window, entries should be cleared
+    limiter.cleanup();
+    // The entry should have been cleaned up since windowMs=1ms has passed
+  });
+});
+
+// ── File upload size limit tests ──
+
+describe("Source code — upload routes enforce file size limits", () => {
+  const root = join(__dirname, "..", "..");
+
+  it("parse route has MAX_FILE_SIZE constant", () => {
+    const content = readFileSync(join(root, "src", "app", "api", "parse", "route.ts"), "utf8");
+    expect(content).toContain("MAX_FILE_SIZE");
+    expect(content).toContain("status: 413");
+  });
+
+  it("parse-pptx route has MAX_FILE_SIZE constant", () => {
+    const content = readFileSync(join(root, "src", "app", "api", "parse-pptx", "route.ts"), "utf8");
+    expect(content).toContain("MAX_FILE_SIZE");
+    expect(content).toContain("status: 413");
+  });
+});
+
+// ── Image download buffer cap tests ──
+
+describe("Source code — image downloads enforce size limits", () => {
+  const root = join(__dirname, "..", "..");
+
+  it("build-pptx route has image size cap", () => {
+    const content = readFileSync(join(root, "src", "app", "api", "build-pptx", "route.ts"), "utf8");
+    expect(content).toContain("MAX_PPTX_IMAGE_BYTES");
+    expect(content).toContain("Image too large");
+  });
+
+  it("image-proxy route has image size cap", () => {
+    const content = readFileSync(join(root, "src", "app", "api", "image-proxy", "route.ts"), "utf8");
+    expect(content).toContain("MAX_IMAGE_BYTES");
+    expect(content).toContain("Image too large");
+  });
+
+  it("image search service has vision image size cap", () => {
+    const content = readFileSync(join(root, "src", "lib", "image-search.ts"), "utf8");
+    expect(content).toContain("MAX_VISION_IMAGE_BYTES");
+  });
+});
+
+// ── Rate limiting presence tests ──
+
+describe("Source code — expensive routes have rate limiting", () => {
+  const root = join(__dirname, "..", "..");
+
+  const rateLimitedRoutes = [
+    "src/app/api/generate/route.ts",
+    "src/app/api/generate-full/route.ts",
+    "src/app/api/images/route.ts",
+    "src/app/api/edit/route.ts",
+    "src/app/api/generate-image/route.ts",
+    "src/app/api/slide-variants/route.ts",
+    "src/app/api/parse/route.ts",
+    "src/app/api/parse-pptx/route.ts",
+    "src/app/api/image-proxy/route.ts",
+  ];
+
+  for (const route of rateLimitedRoutes) {
+    it(`${route} imports rate-limit`, () => {
+      const content = readFileSync(join(root, route), "utf8");
+      expect(content).toContain("rateLimiters");
+      expect(content).toContain("status: 429");
+    });
+  }
+});
+
+// ── Input validation tests ──
+
+describe("Source code — image search input validation", () => {
+  const root = join(__dirname, "..", "..");
+
+  it("images route validates search term array sizes", () => {
+    const content = readFileSync(join(root, "src", "app", "api", "images", "route.ts"), "utf8");
+    expect(content).toContain("MAX_SEARCH_TERM_GROUPS");
+    expect(content).toContain("MAX_QUERY_LENGTH");
+  });
+
+  it("images route strips control characters from queries", () => {
+    const content = readFileSync(join(root, "src", "app", "api", "images", "route.ts"), "utf8");
+    expect(content).toMatch(/\\x00-\\x1f/);
+  });
+});
+
+// ── Manual creations server-side persistence tests ──
+
+describe("Source code — manual creations use server-side persistence", () => {
+  const root = join(__dirname, "..", "..");
+
+  it("manual-creations route uses server-side store", () => {
+    const content = readFileSync(join(root, "src", "app", "api", "manual-creations", "route.ts"), "utf8");
+    expect(content).toContain("getManualCreationsState");
+    expect(content).toContain("setManualCreationsState");
+  });
+
+  it("manual-creations-store persists to data directory", () => {
+    const content = readFileSync(join(root, "src", "lib", "manual-creations-store.ts"), "utf8");
+    expect(content).toContain("manual-creations.json");
+  });
+});
+
+// ── .env.example documentation ──
+
+describe(".env.example — documents all environment variables", () => {
+  const root = join(__dirname, "..", "..");
+  const envExample = readFileSync(join(root, ".env.example"), "utf8");
+
+  it("documents ENCRYPTION_KEY", () => {
+    expect(envExample).toContain("ENCRYPTION_KEY");
+    expect(envExample).toContain("openssl rand -hex 32");
+  });
+
+  it("does not contain actual secret values", () => {
+    const lines = envExample.split("\n").filter((l) => !l.startsWith("#") && l.includes("="));
+    for (const line of lines) {
+      const value = line.split("=")[1]?.trim();
+      // Values should be empty or commented out
+      expect(value).toBeFalsy();
+    }
   });
 });

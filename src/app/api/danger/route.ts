@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getSessionId } from "@/lib/session";
 import { deleteAllAiKeys, deleteAllImageSourceKeys, deleteAllKeys } from "@/lib/key-store";
 import { getUserState, setUserState, deleteUserState } from "@/lib/state-store";
 import { clearManualCreationsState } from "@/lib/manual-creations-store";
@@ -25,7 +24,6 @@ const VALID_ACTIONS: DangerAction[] = [
 
 export async function POST(req: NextRequest) {
   try {
-    const sessionId = await getSessionId();
     const body = await req.json();
     const action = body.action as string;
 
@@ -35,11 +33,11 @@ export async function POST(req: NextRequest) {
 
     switch (action as DangerAction) {
       case "remove-ai-keys":
-        deleteAllAiKeys(sessionId);
+        deleteAllAiKeys();
         return NextResponse.json({ ok: true, cleared: "ai-keys" });
 
       case "remove-image-keys":
-        deleteAllImageSourceKeys(sessionId);
+        deleteAllImageSourceKeys();
         return NextResponse.json({ ok: true, cleared: "image-keys" });
 
       case "remove-manual":
@@ -47,40 +45,40 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: true, cleared: "manual" });
 
       case "remove-ai-creations": {
-        const state = getUserState(sessionId);
+        const state = getUserState();
         if (state && Array.isArray(state.history)) {
           state.history = (state.history as Record<string, unknown>[]).filter(
             (e) => e.type !== "presentation"
           );
-          setUserState(sessionId, state);
+          setUserState(state);
         }
         return NextResponse.json({ ok: true, cleared: "ai-creations" });
       }
 
       case "remove-notes": {
-        const state = getUserState(sessionId);
+        const state = getUserState();
         if (state && Array.isArray(state.history)) {
           state.history = (state.history as Record<string, unknown>[]).filter(
             (e) => e.type !== "notes"
           );
-          setUserState(sessionId, state);
+          setUserState(state);
         }
         return NextResponse.json({ ok: true, cleared: "notes" });
       }
 
       case "remove-all-creations": {
         clearManualCreationsState();
-        const state = getUserState(sessionId);
+        const state = getUserState();
         if (state) {
           state.history = [];
-          setUserState(sessionId, state);
+          setUserState(state);
         }
         return NextResponse.json({ ok: true, cleared: "all-creations" });
       }
 
       case "remove-everything":
-        deleteAllKeys(sessionId);
-        deleteUserState(sessionId);
+        deleteAllKeys();
+        deleteUserState();
         clearManualCreationsState();
         return NextResponse.json({ ok: true, cleared: "everything" });
     }

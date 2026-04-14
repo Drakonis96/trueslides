@@ -1,6 +1,9 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: 'standalone',
+  // Allow mobile devices on the LAN to reach the dev server (presenter remote).
+  // The '*' entry permits any origin during development only.
+  allowedDevOrigins: ['*'],
   images: {
     remotePatterns: [
       {

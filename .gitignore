@@ -35,6 +35,7 @@ data/keys.json
 # server-side user state
 data/state.json
 data/manual-creations.json
+data/slide-images/
 
 # session / auth artefacts
 cookies.txt

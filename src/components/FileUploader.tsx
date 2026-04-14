@@ -65,16 +65,22 @@ export default function FileUploader() {
       {/* Drop zone */}
       <div
         onDragOver={(e) => {
+          if (uploading) return;
           e.preventDefault();
           setDragging(true);
         }}
         onDragLeave={() => setDragging(false)}
-        onDrop={onDrop}
-        onClick={() => fileRef.current?.click()}
-        className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-colors ${
-          dragging
-            ? "border-[var(--accent)] bg-[var(--accent)]/10"
-            : "border-[var(--border)] hover:border-[var(--muted)]"
+        onDrop={(e) => {
+          if (uploading) return;
+          onDrop(e);
+        }}
+        onClick={() => !uploading && fileRef.current?.click()}
+        className={`border-2 border-dashed rounded-xl p-8 text-center transition-colors ${
+          uploading
+            ? "border-[var(--border)] opacity-60 cursor-not-allowed"
+            : dragging
+            ? "border-[var(--accent)] bg-[var(--accent)]/10 cursor-pointer"
+            : "border-[var(--border)] hover:border-[var(--muted)] cursor-pointer"
         }`}
       >
         <input
@@ -82,21 +88,39 @@ export default function FileUploader() {
           type="file"
           accept=".pdf,.docx,.txt"
           className="hidden"
+          disabled={uploading}
           onChange={(e) => {
             const file = e.target.files?.[0];
             if (file) handleFile(file);
           }}
         />
-        <div className="text-[var(--muted)] mb-2"><IconUpload size={32} /></div>
-        <p className="text-sm text-[var(--muted)]">
-          {uploading ? "Processing..." : t.dragDrop}
-        </p>
-        <button
-          type="button"
-          className="mt-3 text-xs text-[var(--accent)] hover:text-[var(--accent-hover)] font-medium"
-        >
-          {t.browse}
-        </button>
+        {uploading ? (
+          <>
+            <div className="text-[var(--accent)] mb-3 flex justify-center">
+              <svg className="animate-spin h-8 w-8" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+            </div>
+            <p className="text-sm text-[var(--muted)] font-medium">
+              {lang === "es" ? "Procesando archivo..." : "Processing file..."}
+            </p>
+            <div className="mt-3 w-full bg-[var(--border)] rounded-full h-1.5 overflow-hidden">
+              <div className="bg-[var(--accent)] h-full rounded-full animate-pulse" style={{ width: "60%" }} />
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="text-[var(--muted)] mb-2"><IconUpload size={32} /></div>
+            <p className="text-sm text-[var(--muted)]">{t.dragDrop}</p>
+            <button
+              type="button"
+              className="mt-3 text-xs text-[var(--accent)] hover:text-[var(--accent-hover)] font-medium"
+            >
+              {t.browse}
+            </button>
+          </>
+        )}
       </div>
 
       {error && (

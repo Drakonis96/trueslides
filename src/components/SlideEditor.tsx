@@ -1,13 +1,16 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAppStore } from "@/lib/store";
 import { UI_TEXT } from "@/lib/presets";
 import { ImageAdjustment, SlideData, OutputLanguage, OUTPUT_LANGUAGE_NAMES, SLIDE_LAYOUTS, SlideLayoutId } from "@/lib/types";
 import { DEFAULT_IMAGE_ADJUSTMENT, getImageAdjustmentStyle, setSlideImageAdjustment } from "@/lib/image-adjustments";
+import { fetchImagesWithCache } from "@/lib/image-cache-idb";
+import { prefetchImageBlob, getCachedBlob } from "@/lib/image-blob-cache";
 import { LayoutThumbnail, LAYOUT_LABELS } from "./LayoutSelector";
 import { IconRefresh, IconChevronLeft, IconChevronRight, IconImage, IconUndo, IconLayout, IconSparkles, IconLoader, IconSearch, IconWand, IconFullscreen, IconCrop } from "./Icons";
 import ImageGenModal from "./ImageGenModal";
+import { Grid as VirtualGrid, CellComponentProps } from "react-window";
 import ImageSearchModal from "./ImageSearchModal";
 import FullscreenEditor from "./FullscreenEditor";
 
@@ -65,6 +68,7 @@ function ShimmerOverlay() {
 function SlidePreview({
   slide,
   onImageClick,
+  onImageDrop,
   onSlideClick,
   refreshingIndex,
   isUpdating,
@@ -72,6 +76,7 @@ function SlidePreview({
 }: {
   slide: SlideData;
   onImageClick?: (imgIndex: number) => void;
+  onImageDrop?: (imgIndex: number, url: string, source: string) => void;
   onSlideClick?: () => void;
   refreshingIndex?: number | null;
   isUpdating?: boolean;
@@ -96,11 +101,38 @@ function SlidePreview({
       : slide.slideLayout || globalLayout || "single";
   const isFocus = viewMode === "focus";
   const canInteractWithImages = isFocus && typeof onImageClick === "function";
+
+  // ── Resolve image URLs from blob cache for instant rendering ──
+  const [resolvedUrls, setResolvedUrls] = useState<Record<string, string>>({});
+  useEffect(() => {
+    let cancelled = false;
+    const urls = slide.imageUrls.filter((u) => u && !u.startsWith("data:"));
+    if (urls.length === 0) { setResolvedUrls({}); return; }
+    void (async () => {
+      const map: Record<string, string> = {};
+      await Promise.all(
+        urls.map(async (url) => {
+          const cached = await getCachedBlob(url);
+          if (cached && !cancelled) map[url] = cached;
+        }),
+      );
+      if (!cancelled) setResolvedUrls(map);
+    })();
+    return () => { cancelled = true; };
+  }, [slide.imageUrls]);
+
+  // Use cached blob data URIs when available, otherwise fall back to original URL
+  const resolvedSlide = {
+    ...slide,
+    imageUrls: slide.imageUrls.map((u) => resolvedUrls[u] || u),
+  };
+
   const layoutDef = SLIDE_LAYOUTS.find((l) => l.id === layoutId);
   const expectedImages = layoutDef?.imageCount ?? 1;
-  const bgHex = `#${slideBgColor || "FFFFFF"}`;
+  const effectiveBg = slide.bgColor || slideBgColor || "000000";
+  const bgHex = `#${effectiveBg}`;
   // Detect if bg is dark to adjust text colors
-  const bgIsDark = isDarkColor(slideBgColor || "FFFFFF");
+  const bgIsDark = isDarkColor(effectiveBg);
   const titleColor = bgIsDark ? "text-white" : "text-slate-900";
   const bulletColor = bgIsDark ? "text-slate-300" : "text-slate-600";
   const sectionColor = bgIsDark ? "" : "brightness-75";
@@ -110,20 +142,79 @@ function SlidePreview({
     return getImageAdjustmentStyle(slide.imageAdjustments?.[index]);
   };
 
+  // ── Drag-and-drop state ──
+  const [dragOverSlot, setDragOverSlot] = useState<number | null>(null);
+  const canDrop = isFocus && typeof onImageDrop === "function";
+
+  const handleDragOver = (e: React.DragEvent) => {
+    if (!canDrop) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  };
+
+  const handleDrop = (e: React.DragEvent, slotIndex: number) => {
+    if (!canDrop) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOverSlot(null);
+
+    // Try to extract a URL first (covers browser image drags)
+    const uriList = e.dataTransfer.getData("text/uri-list");
+    const html = e.dataTransfer.getData("text/html");
+    const plainText = e.dataTransfer.getData("text/plain");
+
+    // Extract src from <img> in html payload
+    const htmlSrc = html ? html.match(/<img[^>]+src=["']([^"']+)["']/i)?.[1] : null;
+
+    const droppedUrl = (uriList || htmlSrc || plainText || "").split("\n")[0].trim();
+
+    if (droppedUrl && /^https?:\/\//i.test(droppedUrl)) {
+      onImageDrop!(slotIndex, droppedUrl, "web");
+      return;
+    }
+
+    // File from computer (or browser fallback as blob)
+    const files = e.dataTransfer.files;
+    if (files.length > 0) {
+      const file = files[0];
+      if (!file.type.startsWith("image/")) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === "string") {
+          onImageDrop!(slotIndex, reader.result, "local");
+        }
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const dragSlotProps = (slotIndex: number) =>
+    canDrop
+      ? {
+          onDragOver: handleDragOver,
+          onDragEnter: (e: React.DragEvent) => { e.preventDefault(); setDragOverSlot(slotIndex); },
+          onDragLeave: () => setDragOverSlot(null),
+          onDrop: (e: React.DragEvent) => handleDrop(e, slotIndex),
+        }
+      : {};
+
   // Render an image slot (with image or placeholder)
   const renderImageSlot = (index: number, className?: string, style?: React.CSSProperties) => {
-    const url = slide.imageUrls[index];
+    const url = resolvedSlide.imageUrls[index];
     const source = slide.imageSources?.[index];
     const isRefreshing = refreshingIndex === index;
+
+    const isDragOver = dragOverSlot === index;
 
     if (!url) {
       if (canInteractWithImages) {
         return (
           <button
             key={index}
-            className={`flex flex-col items-center justify-center gap-1.5 border-2 border-dashed border-[var(--border)] rounded-lg bg-black/5 hover:bg-black/10 transition-colors cursor-pointer ${className || ""}`}
+            className={`flex flex-col items-center justify-center gap-1.5 border-2 border-dashed rounded-lg transition-colors cursor-pointer ${isDragOver ? "border-[var(--accent)] bg-[var(--accent)]/10 scale-[1.02]" : "border-[var(--border)] bg-black/5 hover:bg-black/10"} ${className || ""}`}
             style={style}
             onClick={() => onImageClick?.(index)}
+            {...dragSlotProps(index)}
           >
             {isRefreshing ? (
               <IconRefresh size={20} className="animate-spin text-[var(--muted)]" />
@@ -171,9 +262,10 @@ function SlidePreview({
     return (
       <button
         key={index}
-        className={`overflow-hidden rounded-lg group relative ${className || ""}`}
+        className={`overflow-hidden rounded-lg group relative ${isDragOver ? "ring-2 ring-[var(--accent)] scale-[1.02]" : ""} ${className || ""}`}
         style={style}
         onClick={() => onImageClick?.(index)}
+        {...dragSlotProps(index)}
       >
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img src={url} alt="" className="w-full h-full" loading="lazy" style={getImageStyle(index)} />
@@ -236,14 +328,15 @@ function SlidePreview({
       {/* ── Image-only: single full-bleed ── */}
       {imageOnly && layoutId === "single" && (
         <div className="absolute inset-0">
-          {slide.imageUrls[0] ? (
+          {resolvedSlide.imageUrls[0] ? (
             canInteractWithImages ? (
               <button
-                className="w-full h-full relative group"
+                className={`w-full h-full relative group ${dragOverSlot === 0 ? "ring-4 ring-inset ring-[var(--accent)]" : ""}`}
                 onClick={() => onImageClick?.(0)}
+                {...dragSlotProps(0)}
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={slide.imageUrls[0]} alt="" className="w-full h-full" loading="lazy" style={getImageStyle(0)} />
+                <img src={resolvedSlide.imageUrls[0]} alt="" className="w-full h-full" loading="lazy" style={getImageStyle(0)} />
                 <div className="absolute inset-0 bg-black/30" />
                 {refreshingIndex === 0 ? (
                   <div className="absolute inset-0 z-10">
@@ -276,7 +369,7 @@ function SlidePreview({
             ) : (
               <div className="w-full h-full relative">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={slide.imageUrls[0]} alt="" className="w-full h-full" loading="lazy" style={getImageStyle(0)} />
+                <img src={resolvedSlide.imageUrls[0]} alt="" className="w-full h-full" loading="lazy" style={getImageStyle(0)} />
                 <div className="absolute inset-0 bg-black/30" />
                 {showImageSource && slide.imageSources?.[0] && (
                   <div className="absolute top-3 right-3 z-5 text-xs font-medium max-w-[calc(100%-24px)] truncate" style={{ color: `#${imageSourceFontColor}` }}>
@@ -289,8 +382,9 @@ function SlidePreview({
             /* Placeholder for missing single image */
             canInteractWithImages ? (
               <button
-                className="w-full h-full flex flex-col items-center justify-center gap-2 bg-black/5 hover:bg-black/10 transition-colors"
+                className={`w-full h-full flex flex-col items-center justify-center gap-2 transition-colors ${dragOverSlot === 0 ? "bg-[var(--accent)]/10 border-2 border-dashed border-[var(--accent)]" : "bg-black/5 hover:bg-black/10"}`}
                 onClick={() => onImageClick?.(0)}
+                {...dragSlotProps(0)}
               >
                 {refreshingIndex === 0 ? (
                   <IconRefresh size={28} className="animate-spin text-[var(--muted)]" />
@@ -666,6 +760,101 @@ function PresenterNotesBlock({
   );
 }
 
+// ── Virtualized grid for "all slides" view ──
+
+const VIRTUAL_THRESHOLD = 8; // Slides below this count use a plain grid
+const GRID_GAP = 16; // gap-4 = 16px
+const ASPECT_RATIO = 9 / 16;
+
+interface SlideCellProps {
+  slides: SlideData[];
+  columnCount: number;
+  onSlideClick: (index: number) => void;
+}
+
+function SlideCell({
+  columnIndex,
+  rowIndex,
+  style,
+  slides,
+  columnCount,
+  onSlideClick,
+}: CellComponentProps<SlideCellProps>) {
+  const idx = rowIndex * columnCount + columnIndex;
+  if (idx >= slides.length) return null;
+  const s = slides[idx];
+  return (
+    <div style={{ ...style, paddingRight: columnIndex < columnCount - 1 ? GRID_GAP : 0, paddingBottom: GRID_GAP }}>
+      <SlidePreview
+        slide={s}
+        onSlideClick={() => onSlideClick(s.index)}
+      />
+    </div>
+  );
+}
+
+function VirtualizedSlideGrid({
+  slides,
+  onSlideClick,
+}: {
+  slides: SlideData[];
+  onSlideClick: (index: number) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [containerWidth, setContainerWidth] = useState(0);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(([entry]) => {
+      setContainerWidth(entry.contentRect.width);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Responsive column count (matches md:grid-cols-2)
+  const columnCount = containerWidth >= 768 ? 2 : 1;
+
+  if (slides.length < VIRTUAL_THRESHOLD) {
+    return (
+      <div ref={containerRef} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {slides.map((s) => (
+          <SlidePreview
+            key={s.id}
+            slide={s}
+            onSlideClick={() => onSlideClick(s.index)}
+          />
+        ))}
+      </div>
+    );
+  }
+
+  const colWidth = containerWidth > 0
+    ? (containerWidth - GRID_GAP * (columnCount - 1)) / columnCount
+    : 300;
+  const rowHeight = Math.round(colWidth * ASPECT_RATIO) + GRID_GAP;
+  const rowCount = Math.ceil(slides.length / columnCount);
+  const gridHeight = Math.min(rowCount * rowHeight, 720);
+
+  return (
+    <div ref={containerRef}>
+      {containerWidth > 0 && (
+        <VirtualGrid
+          cellComponent={SlideCell}
+          cellProps={{ slides, columnCount, onSlideClick }}
+          columnCount={columnCount}
+          columnWidth={colWidth + (columnCount > 1 ? GRID_GAP / columnCount : 0)}
+          rowCount={rowCount}
+          rowHeight={rowHeight}
+          style={{ height: gridHeight, overflowX: "hidden" }}
+          overscanCount={2}
+        />
+      )}
+    </div>
+  );
+}
+
 // ── Main Editor ──
 export default function SlideEditor() {
   const {
@@ -818,10 +1007,7 @@ export default function SlideEditor() {
 
       const { provider: effProvider, modelId: effModelId } = getEffectiveSelection();
 
-      const imgRes = await fetch("/api/images", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const imgData = await fetchImagesWithCache({
           searchTerms: [terms],
           presentationTopic: presentation.title,
           slideContexts: [{
@@ -833,12 +1019,10 @@ export default function SlideEditor() {
           aiConfig: { provider: effProvider, modelId: effModelId },
           enabledSources: settings.enabledImageSources,
           imageVerification: settings.imageVerification,
-        }),
-      });
-      const imgData = await imgRes.json();
+        });
 
-      if (imgRes.ok && imgData.images?.[0]) {
-        const candidates: { url: string; thumbUrl: string; title?: string; source?: string }[] = imgData.images[0];
+      if (imgData.ok && imgData.images?.[0]) {
+        const candidates = imgData.images[0] as { url: string; thumbUrl: string; title?: string; source?: string }[];
         const currentUrl = currentSlide.imageUrls[imgSlotIndex];
         // Pick a URL that isn't the current one (double-check client-side)
         const replacement = candidates.find((c) => c.url !== currentUrl && c.thumbUrl !== currentUrl);
@@ -875,6 +1059,8 @@ export default function SlideEditor() {
             imageSources: newSources,
             imageAdjustments: resetImageAdjustmentForSlot(currentSlide, imgSlotIndex),
           });
+          // Pre-download image blob in background for faster preview & PPTX export
+          prefetchImageBlob(replacement.url);
           void recordImageFeedback({
             action: "selected",
             imageUrl: replacement.url,
@@ -1009,6 +1195,8 @@ export default function SlideEditor() {
       imageSources: newSources,
       imageAdjustments: resetImageAdjustmentForSlot(currentSlide, targetSlotIndex),
     });
+    // Pre-download image blob in background for faster preview & PPTX export
+    prefetchImageBlob(image.url);
     setImageSearchSlot(targetSlotIndex);
     rememberImageSearchSlot(currentSlide.index, targetSlotIndex);
     void recordImageFeedback({
@@ -1026,6 +1214,23 @@ export default function SlideEditor() {
     });
     setImageSearchNeedsSlotChoice(false);
     setShowImageSearchModal(false);
+  };
+
+  // ── Handle image drop from computer or web ──
+  const handleImageDrop = (slotIndex: number, url: string, source: string) => {
+    if (!currentSlide) return;
+    const newUrls = [...currentSlide.imageUrls];
+    newUrls[slotIndex] = url;
+    const newSources = [...(currentSlide.imageSources || Array(currentSlide.imageUrls.length).fill(""))];
+    newSources[slotIndex] = source;
+    updateSlide(currentSlide.index, {
+      imageUrls: newUrls,
+      imageSources: newSources,
+      imageAdjustments: resetImageAdjustmentForSlot(currentSlide, slotIndex),
+    });
+    if (!url.startsWith("data:")) {
+      prefetchImageBlob(url);
+    }
   };
 
   // ── Generate AI image ──
@@ -1091,6 +1296,8 @@ export default function SlideEditor() {
           imageSources: newSources,
           imageAdjustments: resetImageAdjustmentForSlot(currentSlide, slotIdx),
         });
+        // Pre-download image blob in background for faster preview & PPTX export
+        prefetchImageBlob(data.imageUrl);
       }
     } catch {
       setError("Failed to generate image");
@@ -1127,10 +1334,7 @@ export default function SlideEditor() {
       const contextQuery = [slide.title, slide.section || ""].filter(Boolean).join(" ");
       const terms = [contextQuery, ...aiTerms, slide.title || ""].filter(Boolean).slice(0, 4);
 
-      const imgRes = await fetch("/api/images", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const imgData = await fetchImagesWithCache({
           searchTerms: [terms],
           presentationTopic: presentation!.title,
           slideContexts: [{
@@ -1141,12 +1345,10 @@ export default function SlideEditor() {
           exclude: existingUrls,
           enabledSources: settings.enabledImageSources,
           imageVerification: settings.imageVerification,
-        }),
-      });
-      const imgData = await imgRes.json();
+        });
 
-      if (imgRes.ok && imgData.images?.[0]) {
-        const candidates: { url: string; thumbUrl: string }[] = imgData.images[0];
+      if (imgData.ok && imgData.images?.[0]) {
+        const candidates = imgData.images[0] as { url: string; thumbUrl: string }[];
         const newUrls = candidates
           .filter((c) => !existingUrls.includes(c.url) && !existingUrls.includes(c.thumbUrl))
           .slice(0, missing)
@@ -1156,6 +1358,8 @@ export default function SlideEditor() {
           updateSlide(slideIndex, {
             imageUrls: [...existingUrls, ...newUrls],
           });
+          // Pre-download new image blobs in background
+          for (const u of newUrls) prefetchImageBlob(u);
         }
       }
     } catch {
@@ -1175,10 +1379,7 @@ export default function SlideEditor() {
     const searchTerms = slidesNeedingImages.map((s) => s.imageSearchTerms!);
 
     try {
-      const imgRes = await fetch("/api/images", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const imgData = await fetchImagesWithCache({
           searchTerms,
           presentationTopic: presentation!.title,
           slideContexts: slidesNeedingImages.map((s) => ({
@@ -1188,18 +1389,16 @@ export default function SlideEditor() {
           })),
           enabledSources: settings.enabledImageSources,
           imageVerification: settings.imageVerification,
-        }),
-      });
-      const imgData = await imgRes.json();
+        });
       const imageMap = new Map<number, string[]>();
 
-      if (imgRes.ok && imgData.images) {
+      if (imgData.ok && imgData.images) {
         slidesNeedingImages.forEach((slide, i) => {
-          const imgs: { url: string; thumbUrl: string }[] = imgData.images[i] || [];
-          imageMap.set(
-            slide.index,
-            imgs.slice(0, 4).map((img) => img.url)
-          );
+          const imgs = (imgData.images![i] || []) as { url: string; thumbUrl: string }[];
+          const urls = imgs.slice(0, 4).map((img) => img.url);
+          imageMap.set(slide.index, urls);
+          // Pre-download image blobs in background
+          for (const u of urls) prefetchImageBlob(u);
         });
       }
       return imageMap;
@@ -1213,10 +1412,7 @@ export default function SlideEditor() {
     if (terms.length === 0) return [];
 
     try {
-      const imgRes = await fetch("/api/images", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const imgData = await fetchImagesWithCache({
           searchTerms: [terms],
           presentationTopic: presentation!.title,
           slideContexts: [{
@@ -1226,12 +1422,10 @@ export default function SlideEditor() {
           }],
           enabledSources: settings.enabledImageSources,
           imageVerification: settings.imageVerification,
-        }),
-      });
-      const imgData = await imgRes.json();
-      if (!imgRes.ok || !imgData.images?.[0]) return [];
+        });
+      if (!imgData.ok || !imgData.images?.[0]) return [];
 
-      const imgs: { url: string }[] = imgData.images[0] || [];
+      const imgs = (imgData.images[0] || []) as { url: string }[];
       return imgs.slice(0, 4).map((img) => img.url);
     } catch {
       return [];
@@ -1418,16 +1612,11 @@ export default function SlideEditor() {
 
       {/* Main editor area */}
       {selectedSlideIndex === "all" ? (
-        /* ── Grid view for "all" ── */
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {presentation.slides.map((s) => (
-            <SlidePreview
-              key={s.id}
-              slide={s}
-              onSlideClick={() => setSelectedSlideIndex(s.index)}
-            />
-          ))}
-        </div>
+        /* ── Grid view for "all" — virtualized for large decks ── */
+        <VirtualizedSlideGrid
+          slides={presentation.slides}
+          onSlideClick={(index) => setSelectedSlideIndex(index)}
+        />
       ) : (
         currentSlide && (
           <div className="space-y-4">
@@ -1448,6 +1637,7 @@ export default function SlideEditor() {
                 <SlidePreview
                   slide={currentSlide}
                   onImageClick={(slot) => openImageSearchModal(slot)}
+                  onImageDrop={handleImageDrop}
                   refreshingIndex={refreshingImage}
                   viewMode="focus"
                 />

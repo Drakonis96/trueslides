@@ -29,7 +29,6 @@ export interface PartialSlideInfo {
 
 export interface Job {
   id: string;
-  sessionId: string;
   type: JobType;
   status: JobStatus;
   progress: JobProgress;
@@ -72,11 +71,10 @@ function getJobsMap(): Map<string, Job> {
   return globalThis[_globalKey];
 }
 
-export function createJob(id: string, sessionId: string, type: JobType, title?: string): Job {
+export function createJob(id: string, type: JobType, title?: string): Job {
   const jobs = getJobsMap();
   const job: Job = {
     id,
-    sessionId,
     type,
     status: "running",
     progress: { percent: 0, message: "" },
@@ -90,9 +88,9 @@ export function createJob(id: string, sessionId: string, type: JobType, title?: 
   return job;
 }
 
-export function getJob(id: string, sessionId: string): Job | null {
+export function getJob(id: string): Job | null {
   const job = getJobsMap().get(id);
-  if (!job || job.sessionId !== sessionId) return null;
+  if (!job) return null;
   return job;
 }
 
@@ -112,12 +110,10 @@ export function getJobInfo(job: Job): JobInfo {
   };
 }
 
-export function getSessionJobs(sessionId: string): JobInfo[] {
+export function getAllJobs(): JobInfo[] {
   const result: JobInfo[] = [];
   for (const job of getJobsMap().values()) {
-    if (job.sessionId === sessionId) {
-      result.push(getJobInfo(job));
-    }
+    result.push(getJobInfo(job));
   }
   return result.sort((a, b) => b.createdAt - a.createdAt);
 }
@@ -172,10 +168,10 @@ export function failJob(id: string, error: string): void {
   }
 }
 
-export function cancelJob(id: string, sessionId: string): boolean {
+export function cancelJob(id: string): boolean {
   const jobs = getJobsMap();
   const job = jobs.get(id);
-  if (!job || job.sessionId !== sessionId) return false;
+  if (!job) return false;
   if (job.status !== "running") return false;
   job.abortController.abort();
   job.status = "cancelled";
@@ -183,9 +179,18 @@ export function cancelJob(id: string, sessionId: string): boolean {
   return true;
 }
 
-// Clean up old completed/failed jobs after 24h
-const CLEANUP_INTERVAL = 60 * 60 * 1000; // 1 hour
-const MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
+// Clean up old completed/failed jobs more aggressively to prevent memory accumulation
+/**
+ * CLEANUP_INTERVAL: Run cleanup every 30 minutes instead of 1 hour.
+ * This prevents accumulation of stale job entries during long sessions.
+ */
+const CLEANUP_INTERVAL = 30 * 60 * 1000; // 30 minutes
+
+/**
+ * MAX_AGE: Keep completed jobs for 6 hours instead of 24 hours.
+ * Completed jobs consume server-side memory; older jobs are safely discarded.
+ */
+const MAX_AGE = 6 * 60 * 60 * 1000; // 6 hours
 
 setInterval(() => {
   const jobs = getJobsMap();

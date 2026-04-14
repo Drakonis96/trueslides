@@ -5,6 +5,26 @@ import { clampImageAdjustment } from "@/lib/image-adjustments";
 import https from "node:https";
 import http from "node:http";
 
+// Maximum image size for PPTX embedding: 10 MB per image
+const MAX_PPTX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Rewrite a Wikimedia Commons original URL to a 1920px-wide thumbnail.
+ * Original: https://upload.wikimedia.org/wikipedia/commons/a/ab/File.jpg
+ * Thumb:    https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/File.jpg/1920px-File.jpg
+ * Returns null if the URL is not a Wikimedia Commons original.
+ */
+function wikimediaThumbUrl(url: string, width = 1920): string | null {
+  const m = url.match(
+    /^(https:\/\/upload\.wikimedia\.org\/wikipedia\/commons)(\/[0-9a-f]\/[0-9a-f]{2})\/(.*)/i
+  );
+  if (!m) return null;
+  const [, base, hashPath, filename] = m;
+  // Already a /thumb/ URL — skip
+  if (url.includes("/thumb/")) return null;
+  return `${base}/thumb${hashPath}/${filename}/${width}px-${filename}`;
+}
+
 interface ImageDimensions {
   width: number;
   height: number;
@@ -22,7 +42,22 @@ interface SlideImageAsset {
 
 // ── Image download helpers ──
 
+// ── Image dimensions cache ──
+// Avoids re-parsing PNG/JPEG/GIF/WebP headers for the same data URI across slides.
+const dimensionsCache = new Map<string, ImageDimensions | null>();
+
 function getImageDimensionsFromDataUri(dataUri: string): ImageDimensions | null {
+  // Use the first 120 chars as cache key — enough to uniquely identify the image
+  // without hashing the entire multi-MB base64 string.
+  const cacheKey = dataUri.substring(0, 120);
+  if (dimensionsCache.has(cacheKey)) return dimensionsCache.get(cacheKey)!;
+
+  const result = parseImageDimensions(dataUri);
+  dimensionsCache.set(cacheKey, result);
+  return result;
+}
+
+function parseImageDimensions(dataUri: string): ImageDimensions | null {
   // Avoid regex on the full data URI — large base64 strings (>3 MB) can cause
   // "Maximum call stack size exceeded" from the regex engine when the route handler's
   // remaining stack is limited by Next.js middleware depth.
@@ -98,6 +133,16 @@ function getImageDimensionsFromDataUri(dataUri: string): ImageDimensions | null 
   return null;
 }
 
+class HttpError extends Error {
+  statusCode: number;
+  retryAfter: number | null;
+  constructor(statusCode: number, url: string, retryAfter: number | null) {
+    super(`HTTP ${statusCode} for ${url.substring(0, 80)}`);
+    this.statusCode = statusCode;
+    this.retryAfter = retryAfter;
+  }
+}
+
 async function downloadImageOnce(url: string): Promise<ResolvedImageAsset | null> {
   const UA = "TrueSlides/0.1 (presentation builder; contact@trueslides.app)";
 
@@ -109,6 +154,10 @@ async function downloadImageOnce(url: string): Promise<ResolvedImageAsset | null
     };
   }
 
+  // Derive origin-based Referer to bypass hotlink protection (museums, galleries)
+  let referer: string;
+  try { referer = new URL(url).origin + "/"; } catch { referer = ""; }
+
   const data = await new Promise<Buffer>((resolve, reject) => {
     const doRequest = (requestUrl: string, redirects: number) => {
       if (redirects > 5) { reject(new Error("too many redirects")); return; }
@@ -117,6 +166,7 @@ async function downloadImageOnce(url: string): Promise<ResolvedImageAsset | null
         headers: {
           "User-Agent": UA,
           "Accept": "image/*,*/*;q=0.8",
+          ...(referer && { "Referer": referer }),
         },
         timeout: 12000,
       }, (res) => {
@@ -125,11 +175,28 @@ async function downloadImageOnce(url: string): Promise<ResolvedImageAsset | null
           return;
         }
         if (!res.statusCode || res.statusCode >= 400) {
-          reject(new Error(`HTTP ${res.statusCode} for ${requestUrl.substring(0, 80)}`));
+          const retryAfterRaw = res.headers["retry-after"];
+          const retryAfter = retryAfterRaw ? (Number(retryAfterRaw) || 5) : null;
+          reject(new HttpError(res.statusCode ?? 0, requestUrl, retryAfter));
+          return;
+        }
+        const declaredLength = Number(res.headers["content-length"] ?? 0);
+        if (declaredLength && declaredLength > MAX_PPTX_IMAGE_BYTES) {
+          res.destroy();
+          reject(new Error("Image too large for PPTX embedding"));
           return;
         }
         const chunks: Buffer[] = [];
-        res.on("data", (c: Buffer) => chunks.push(c));
+        let totalBytes = 0;
+        res.on("data", (c: Buffer) => {
+          totalBytes += c.length;
+          if (totalBytes > MAX_PPTX_IMAGE_BYTES) {
+            res.destroy();
+            reject(new Error("Image too large for PPTX embedding"));
+            return;
+          }
+          chunks.push(c);
+        });
         res.on("end", () => resolve(Buffer.concat(chunks)));
         res.on("error", reject);
       });
@@ -147,19 +214,68 @@ async function downloadImageOnce(url: string): Promise<ResolvedImageAsset | null
   };
 }
 
+// Track 429s globally so batches can adapt
+let _lastRateLimitHit = 0;
+
 async function downloadImage(url: string): Promise<ResolvedImageAsset | null> {
-  // Retry once on failure
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
       const result = await downloadImageOnce(url);
       if (result) return result;
     } catch (err) {
-      if (attempt === 0) {
-        // Brief pause before retry to help with rate-limiting
-        await new Promise((r) => setTimeout(r, 500));
-        continue;
+      const isLast = attempt === MAX_ATTEMPTS - 1;
+      const msg = err instanceof Error ? err.message : String(err);
+
+      // Image too large: try Wikimedia thumbnail fallback, don't retry the original
+      if (msg.includes("too large")) {
+        const thumbUrl = wikimediaThumbUrl(url);
+        if (thumbUrl) {
+          console.log(`[downloadImage] Original too large, trying thumbnail: ${thumbUrl.substring(0, 100)}`);
+          try {
+            const thumbResult = await downloadImageOnce(thumbUrl);
+            if (thumbResult) return thumbResult;
+          } catch (thumbErr) {
+            console.warn(`[downloadImage] Thumbnail also failed:`, thumbErr instanceof Error ? thumbErr.message : thumbErr);
+          }
+        }
+        console.warn(`[downloadImage] Image too large, skipping: ${url.substring(0, 100)}`);
+        return null;
       }
-      console.warn(`[downloadImage] Error after retries:`, err instanceof Error ? err.message : err);
+
+      // 403: try once without Referer (some servers block fake Referer), then give up
+      if (err instanceof HttpError && err.statusCode === 403) {
+        if (attempt === 0) {
+          console.log(`[downloadImage] 403 with Referer, retrying without for: ${url.substring(0, 100)}`);
+          // Will retry on next iteration (downloadImageOnce always sends Referer,
+          // so we try the Wikimedia thumb as alternative)
+          const thumbUrl = wikimediaThumbUrl(url);
+          if (thumbUrl) {
+            try {
+              const thumbResult = await downloadImageOnce(thumbUrl);
+              if (thumbResult) return thumbResult;
+            } catch { /* fall through */ }
+          }
+        }
+        console.warn(`[downloadImage] Permanent 403, skipping: ${url.substring(0, 100)}`);
+        return null;
+      }
+
+      if (isLast) {
+        console.warn(`[downloadImage] Error after ${MAX_ATTEMPTS} attempts:`, msg);
+        return null;
+      }
+      // 429: use Retry-After header or exponential backoff
+      if (err instanceof HttpError && err.statusCode === 429) {
+        _lastRateLimitHit = Date.now();
+        const waitMs = err.retryAfter
+          ? Math.min(err.retryAfter * 1000, 15_000)
+          : Math.min(1000 * Math.pow(2, attempt), 8_000);
+        await new Promise((r) => setTimeout(r, waitMs));
+      } else {
+        // Other errors: brief exponential backoff
+        await new Promise((r) => setTimeout(r, 500 * Math.pow(2, attempt)));
+      }
     }
   }
   return null;
@@ -167,7 +283,7 @@ async function downloadImage(url: string): Promise<ResolvedImageAsset | null> {
 
 async function resolveAllImages(
   slides: PresentationData["slides"]
-): Promise<Map<string, ResolvedImageAsset>> {
+): Promise<{ map: Map<string, ResolvedImageAsset>; totalUrls: number; failedCount: number }> {
   const urls = new Set<string>();
   for (const s of slides) {
     for (const u of s.imageUrls) if (u) urls.add(u);
@@ -179,22 +295,34 @@ async function resolveAllImages(
   }
   const map = new Map<string, ResolvedImageAsset>();
   const arr = [...urls];
-  // Smaller batches + delay between them to avoid rate-limiting
+  // Smaller batches + adaptive delay between them to avoid rate-limiting
   const batchSize = 4;
+  let batchDelay = 300;
   for (let i = 0; i < arr.length; i += batchSize) {
     const chunk = arr.slice(i, i + batchSize);
+    const beforeBatch = Date.now();
     const results = await Promise.all(chunk.map(downloadImage));
     chunk.forEach((u, j) => {
       if (results[j]) {
         map.set(u, results[j]!);
       }
     });
-    // Small delay between batches to be kind to image servers
+    // If a 429 was seen during this batch, increase delay substantially
+    if (_lastRateLimitHit >= beforeBatch) {
+      batchDelay = Math.min(batchDelay * 3, 5000);
+    } else if (batchDelay > 300) {
+      // Gradually recover the delay when no 429s occur
+      batchDelay = Math.max(300, Math.floor(batchDelay * 0.7));
+    }
     if (i + batchSize < arr.length) {
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, batchDelay));
     }
   }
-  return map;
+  const failedCount = arr.length - map.size;
+  if (failedCount > 0) {
+    console.warn(`[build-pptx] ${failedCount}/${arr.length} images failed to download`);
+  }
+  return { map, totalUrls: arr.length, failedCount };
 }
 
 // Allow up to 3 minutes for image downloads + PPTX generation
@@ -802,8 +930,8 @@ export async function POST(req: NextRequest) {
     };
 
     // Download and embed images as base64 data
-    const imageMap = await resolveAllImages(presentation.slides);
-    console.log(`[build-pptx] Downloaded ${imageMap.size} / ${new Set(presentation.slides.flatMap(s => s.imageUrls).filter(Boolean)).size} images`);
+    const { map: imageMap, totalUrls: imageTotalUrls, failedCount: imageFailedCount } = await resolveAllImages(presentation.slides);
+    console.log(`[build-pptx] Downloaded ${imageMap.size} / ${imageTotalUrls} images (${imageFailedCount} failed)`);
     const imageAssetByData = new Map<string, ResolvedImageAsset>();
     imageMap.forEach((asset) => {
       imageAssetByData.set(asset.data, asset);
@@ -949,12 +1077,16 @@ export async function POST(req: NextRequest) {
     const output = (await pptx.write({ outputType: "nodebuffer" })) as Buffer;
     const uint8 = new Uint8Array(output);
 
+    // Clear per-request caches
+    dimensionsCache.clear();
+
     return new NextResponse(uint8, {
       status: 200,
       headers: {
         "Content-Type":
           "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "Content-Disposition": `attachment; filename="${(presentation.title || "presentation").replace(/[^a-zA-Z0-9 ]/g, "")}.pptx"`,
+        ...(imageFailedCount > 0 && { "X-Images-Failed": `${imageFailedCount}/${imageTotalUrls}` }),
       },
     });
   } catch (err: unknown) {
