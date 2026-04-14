@@ -1,9 +1,9 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: 'standalone',
-  // Allow mobile devices on the LAN to reach the dev server (presenter remote).
-  // The '*' entry permits any origin during development only.
-  allowedDevOrigins: ['*'],
+  // Allow mobile devices on the LAN to reach the dev server (presenter remote)
+  // and Electron's 127.0.0.1 origin during development.
+  allowedDevOrigins: ['*', 'http://127.0.0.1:3000'],
   images: {
     remotePatterns: [
       {

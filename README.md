@@ -100,6 +100,11 @@ Output formats:
 - An API key for at least one supported AI provider
 - `ENCRYPTION_KEY` configured before storing any provider or image-source keys
 
+### Additional requirements for Electron (desktop app)
+
+- A supported OS: macOS, Windows, or Linux
+- No Docker or browser needed — the app runs as a native desktop window
+
 ## Quick Start
 
 ### 1. Install dependencies
@@ -182,6 +187,36 @@ docker build -t trueslides .
 docker run --rm -p 3000:3000 --env-file .env trueslides
 ```
 
+### Electron (desktop app)
+
+Run the app as a native desktop window with better memory handling and multi-display presenter support.
+
+**Development:**
+
+```bash
+npm run dev:electron
+```
+
+This starts the Next.js dev server and launches Electron simultaneously. Hot-reload works as usual.
+
+**Production build:**
+
+```bash
+npm run build:electron
+```
+
+This runs `next build` and then packages the standalone server into a native app using electron-builder. Output goes to `electron-dist/`.
+
+**Launch without rebuilding (requires a previous `npm run build`):**
+
+```bash
+npm run start:electron
+```
+
+#### Presenter mode with multiple displays
+
+When running inside Electron, starting presenter mode automatically detects connected displays. The audience view opens fullscreen on the external display while the presenter notes stay on the primary monitor. If no external display is connected, the audience view opens as a regular window.
+
 ## Common Workflows
 
 ### Generate a deck with AI
@@ -237,6 +272,7 @@ npx jest __tests__/components/components.test.tsx
 - TypeScript 5
 - Tailwind CSS 4
 - Zustand 5
+- Electron (optional desktop runtime)
 - PptxGenJS 4
 - Jest and Testing Library
 

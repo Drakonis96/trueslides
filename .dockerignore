@@ -30,3 +30,16 @@ jest.setup.ts
 tsconfig.jest.json
 tsconfig.tsbuildinfo
 .env.example
+
+# electron
+electron-dist/
+electron/
+electron-builder.yml
+*.dmg
+*.AppImage
+*.snap
+*.deb
+*.rpm
+*.exe
+*.msi
+*.nsis

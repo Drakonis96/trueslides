@@ -18,6 +18,27 @@ interface PresenterModeProps {
   onExit: () => void;
 }
 
+// ── Electron bridge types (available when running inside Electron) ──
+interface ElectronBridge {
+  isElectron: boolean;
+  getDisplays: () => Promise<{ id: number; label: string; width: number; height: number; isPrimary: boolean }[]>;
+  openAudienceWindow: () => Promise<{ displayId: number; isExternal: boolean }>;
+  closeAudienceWindow: () => Promise<boolean>;
+  onAudienceWindowClosed: (cb: () => void) => () => void;
+}
+
+declare global {
+  interface Window {
+    electron?: ElectronBridge;
+  }
+}
+
+function getElectron(): ElectronBridge | null {
+  return typeof window !== "undefined" && window.electron?.isElectron
+    ? window.electron
+    : null;
+}
+
 export default function PresenterMode({
   slides,
   presentationTitle,
@@ -58,23 +79,48 @@ export default function PresenterMode({
   useEffect(() => {
     if (isAudienceWindow) return;
 
-    // Open audience window
-    const w = window.open(
-      `${window.location.origin}?audience=1`,
-      "trueslides-audience",
-      "popup,width=1280,height=720"
-    );
-    audienceWindowRef.current = w;
+    const electron = getElectron();
 
-    return () => {};
+    if (electron) {
+      // Electron: open audience window on external display via IPC
+      electron.openAudienceWindow().catch(console.error);
+
+      // Listen for audience window being closed externally
+      const unsubscribe = electron.onAudienceWindowClosed(() => {
+        // Audience window was closed by the user — no action needed,
+        // presenter can keep running
+      });
+
+      return () => {
+        unsubscribe();
+      };
+    } else {
+      // Browser: open a popup window
+      const w = window.open(
+        `${window.location.origin}?audience=1`,
+        "trueslides-audience",
+        "popup,width=1280,height=720"
+      );
+      audienceWindowRef.current = w;
+
+      return () => {};
+    }
   }, [isAudienceWindow]);
 
   const handleExit = useCallback(() => {
-    // Close audience window if we opened one
-    if (audienceWindowRef.current && !audienceWindowRef.current.closed) {
-      audienceWindowRef.current.close();
+    const electron = getElectron();
+
+    if (electron) {
+      // Electron: close the managed audience window
+      electron.closeAudienceWindow().catch(console.error);
+    } else {
+      // Browser: close the popup
+      if (audienceWindowRef.current && !audienceWindowRef.current.closed) {
+        audienceWindowRef.current.close();
+      }
+      audienceWindowRef.current = null;
     }
-    audienceWindowRef.current = null;
+
     onExit();
   }, [onExit]);
 

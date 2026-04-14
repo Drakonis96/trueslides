@@ -52,3 +52,14 @@ next-env.d.ts
 .vscode/
 *.swp
 *.swo
+
+# electron
+electron-dist/
+*.dmg
+*.AppImage
+*.snap
+*.deb
+*.rpm
+*.exe
+*.msi
+*.nsis

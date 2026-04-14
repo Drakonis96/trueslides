@@ -1,0 +1,55 @@
+appId: app.trueslides.desktop
+productName: TrueSlides
+copyright: Copyright © 2026 TrueSlides
+
+directories:
+  output: electron-dist
+
+files:
+  - electron/**/*
+  - public/**/*
+  - "!node_modules"
+  - "!src"
+  - "!__tests__"
+  - "!scripts"
+  - "!screenshots"
+  - "!data"
+  - "!.next"
+  - "!.git"
+
+extraResources:
+  # Bundle the Next.js standalone server + static assets
+  - from: .next/standalone
+    to: standalone
+  - from: .next/static
+    to: standalone/.next/static
+  - from: public
+    to: standalone/public
+
+mac:
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+  category: public.app-category.productivity
+  icon: public/logo.png
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: public/logo.png
+
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64
+  category: Office
+  icon: public/logo.png
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
